@@ -74,11 +74,12 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data) {
   PF_ParamDef def;
 
   AEFX_CLR_STRUCT(def);
-  PF_ADD_FLOAT_SLIDERX("Exposure", -10, 10, -4, 4, 0, PF_Precision_HUNDREDTHS,
+  PF_ADD_FLOAT_SLIDERX("Exposure", -10, 10, -4, 4, 1.2, PF_Precision_HUNDREDTHS,
                        PF_ValueDisplayFlag_NONE, 0, EXPOSURE_DISK_ID);
 
   AEFX_CLR_STRUCT(def);
-  PF_ADD_FLOAT_SLIDERX("Radius", 1, 2000, 1, 500, 50, PF_Precision_TENTHS,
+  // The slider spans the whole range so the default sits on it.
+  PF_ADD_FLOAT_SLIDERX("Radius", 1, 2000, 1, 2000, 1000, PF_Precision_TENTHS,
                        PF_ValueDisplayFlag_PIXEL, 0, RADIUS_DISK_ID);
 
   AEFX_CLR_STRUCT(def);
