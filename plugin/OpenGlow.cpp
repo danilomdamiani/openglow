@@ -1,11 +1,14 @@
 // OpenGlow plugin entry point (After Effects effect API, hosted natively by
-// Premiere Pro). Stage 0: registers the effect and its controls and passes the
-// image through unchanged.
+// Premiere Pro). Reads the controls, adapts the host's pixel format and hands
+// the frame to the core glow.
 #include "OpenGlow.h"
 
 #include <algorithm>
 #include <cstdio>
-#include <cstring>
+#include <cstddef>
+#include <vector>
+
+#include "openglow/glow.h"
 
 namespace {
 
@@ -88,42 +91,103 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data) {
   return err;
 }
 
-// Bytes per pixel of a host buffer, or 0 if we don't know the format.
-int BytesPerPixel(PF_InData* in_data, PF_EffectWorld* world) {
+enum class HostFormat { Unknown, BGRA8, BGRA32f, ARGB8, ARGB16 };
+
+HostFormat GetHostFormat(PF_InData* in_data, PF_EffectWorld* world) {
   if (IsPremiere(in_data)) {
     ScopedSuite<PF_PixelFormatSuite1> pixel_formats(in_data, kPFPixelFormatSuite,
                                                     kPFPixelFormatSuiteVersion1);
-    if (!pixel_formats.get()) return 0;
+    if (!pixel_formats.get()) return HostFormat::Unknown;
     PrPixelFormat format = PrPixelFormat_Invalid;
     pixel_formats->GetPixelFormat(world, &format);
     switch (format) {
       case PrPixelFormat_BGRA_4444_8u:
-        return 4;
+        return HostFormat::BGRA8;
       case PrPixelFormat_BGRA_4444_32f:
-        return 16;
+        return HostFormat::BGRA32f;
       default:
-        return 0;
+        return HostFormat::Unknown;
     }
   }
   // After Effects: 8 or 16 bits per channel ARGB (no float until smart render).
-  return PF_WORLD_IS_DEEP(world) ? 8 : 4;
+  return PF_WORLD_IS_DEEP(world) ? HostFormat::ARGB16 : HostFormat::ARGB8;
+}
+
+openglow::GlowParams ReadParams(PF_ParamDef* params[]) {
+  openglow::GlowParams p;
+  p.exposure = static_cast<float>(params[OPENGLOW_EXPOSURE]->u.fs_d.value);
+  p.radius = static_cast<float>(params[OPENGLOW_RADIUS]->u.fs_d.value);
+  p.tint = params[OPENGLOW_TINT]->u.bd.value != 0;
+  const PF_Pixel& color = params[OPENGLOW_TINT_COLOR]->u.cd.value;
+  p.tint_color[0] = color.red / 255.0f;
+  p.tint_color[1] = color.green / 255.0f;
+  p.tint_color[2] = color.blue / 255.0f;
+  return p;
+}
+
+// Integer formats go through a float copy: unpack, glow in place, pack.
+template <typename Channel>
+void RenderInteger(PF_EffectWorld* input, PF_EffectWorld* output, int width, int height,
+                   float max_value, const openglow::GlowParams& params,
+                   openglow::ChannelOrder order) {
+  const std::size_t stride = static_cast<std::size_t>(width) * 4;
+  std::vector<float> buffer(stride * height);
+  const float to_float = 1.0f / max_value;
+  for (int y = 0; y < height; ++y) {
+    const Channel* in = reinterpret_cast<const Channel*>(
+        reinterpret_cast<const char*>(input->data) + static_cast<std::ptrdiff_t>(y) * input->rowbytes);
+    float* row = buffer.data() + y * stride;
+    for (std::size_t i = 0; i < stride; ++i) row[i] = in[i] * to_float;
+  }
+
+  const openglow::ImageView view{buffer.data(), width, height, stride};
+  openglow::render_glow({view.pixels, width, height, stride}, view, params, order);
+
+  for (int y = 0; y < height; ++y) {
+    Channel* out = reinterpret_cast<Channel*>(
+        reinterpret_cast<char*>(output->data) + static_cast<std::ptrdiff_t>(y) * output->rowbytes);
+    const float* row = buffer.data() + y * stride;
+    for (std::size_t i = 0; i < stride; ++i) {
+      const float v = std::clamp(row[i], 0.0f, 1.0f) * max_value + 0.5f;
+      out[i] = static_cast<Channel>(v);
+    }
+  }
 }
 
 PF_Err Render(PF_InData* in_data, PF_OutData* /*out_data*/, PF_ParamDef* params[],
               PF_LayerDef* output) {
   PF_EffectWorld* input = &params[OPENGLOW_INPUT]->u.ld;
-
-  const int bpp = BytesPerPixel(in_data, output);
-  if (bpp == 0) return PF_Err_BAD_CALLBACK_PARAM;
-
+  const openglow::GlowParams glow = ReadParams(params);
   const int width = std::min(input->width, output->width);
   const int height = std::min(input->height, output->height);
-  const size_t row_bytes = static_cast<size_t>(width) * bpp;
-  const char* src = reinterpret_cast<const char*>(input->data);
-  char* dst = reinterpret_cast<char*>(output->data);
-  for (int y = 0; y < height; ++y) {
-    std::memcpy(dst + static_cast<size_t>(y) * output->rowbytes,
-                src + static_cast<size_t>(y) * input->rowbytes, row_bytes);
+  if (width <= 0 || height <= 0) return PF_Err_NONE;
+
+  switch (GetHostFormat(in_data, output)) {
+    case HostFormat::BGRA32f:
+      if (input->rowbytes > 0 && output->rowbytes > 0 && input->rowbytes % sizeof(float) == 0 &&
+          output->rowbytes % sizeof(float) == 0) {
+        // Float buffers are processed directly, no copies.
+        const openglow::ConstImageView in{reinterpret_cast<const float*>(input->data), width,
+                                          height, input->rowbytes / sizeof(float)};
+        const openglow::ImageView out{reinterpret_cast<float*>(output->data), width, height,
+                                      output->rowbytes / sizeof(float)};
+        openglow::render_glow(in, out, glow, openglow::kBGRA);
+      } else {
+        return PF_Err_BAD_CALLBACK_PARAM;
+      }
+      break;
+    case HostFormat::BGRA8:
+      RenderInteger<A_u_char>(input, output, width, height, 255.0f, glow, openglow::kBGRA);
+      break;
+    case HostFormat::ARGB8:
+      RenderInteger<A_u_char>(input, output, width, height, PF_MAX_CHAN8, glow, openglow::kARGB);
+      break;
+    case HostFormat::ARGB16:
+      RenderInteger<A_u_short>(input, output, width, height, PF_MAX_CHAN16, glow,
+                               openglow::kARGB);
+      break;
+    default:
+      return PF_Err_BAD_CALLBACK_PARAM;
   }
   return PF_Err_NONE;
 }

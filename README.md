@@ -3,9 +3,8 @@
 An open-source glow effect for Adobe Premiere Pro (and After Effects), in the
 spirit of Deep Glow, built for speed.
 
-Status: **stage 0**. The effect loads in Premiere with its controls (Exposure,
-Radius, Tint, Tint Color) and passes the image through unchanged. The glow
-itself arrives in stage 1.
+Status: **stage 1**. The glow runs on the CPU with Exposure, Radius, Tint and
+Tint Color. A GPU path comes next.
 
 ## How it works
 
@@ -18,6 +17,14 @@ it can be tested on any platform.
 core/     glow algorithm (plain C++17) + public header
 plugin/   thin adapter for the Adobe SDK (parameters, PiPL resource, render)
 tests/    core tests, run in CI on Windows, macOS and Linux
+```
+
+The glow is a mip pyramid: the image is halved repeatedly with a soft filter,
+then the levels are added back up. The cost barely depends on the radius.
+`openglow_bench` times it:
+
+```
+build/tests/openglow_bench
 ```
 
 ## Building
