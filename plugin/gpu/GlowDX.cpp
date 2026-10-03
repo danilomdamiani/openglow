@@ -5,7 +5,7 @@
 namespace openglow_gpu {
 namespace {
 
-// Mirrors the cbuffer in OpenGlow.hlsl (bound as 16 root constants): 4-byte
+// Mirrors the cbuffer in OpenGlow.hlsl (bound as 19 root constants): 4-byte
 // scalars only, so the C and HLSL packing rules agree.
 struct Params {
   int src_pitch = 0;
@@ -24,8 +24,11 @@ struct Params {
   float tint_r = 1.0f;
   float threshold = 0.0f;
   float knee = 0.0f;
+  int next_width = 0;
+  int next_height = 0;
+  float next_weight = 1.0f;
 };
-static_assert(sizeof(Params) == 64, "Params must match the HLSL cbuffer");
+static_assert(sizeof(Params) == 76, "Params must match the HLSL cbuffer");
 
 struct View {
   void* resource;
@@ -60,8 +63,13 @@ bool Dispatch(DXDevice& device, const ShaderObjectPtr& shader, const Params& par
   return true;
 }
 
+int BytesPerPixel(const Frame& f) { return f.half ? 8 : 16; }
+
+// The shaders index frames per pixel, so rows must be whole pixels apart.
+bool PixelAligned(const Frame& f) { return f.pitch % BytesPerPixel(f) == 0; }
+
 void SetSource(Params& p, const Frame& f) {
-  p.src_pitch = f.pitch;
+  p.src_pitch = f.pitch / BytesPerPixel(f);
   p.src_half = f.half ? 1 : 0;
   p.src_width = f.width;
   p.src_height = f.height;
@@ -75,9 +83,11 @@ bool DXShaders::Load(DXContext& context, const std::wstring& dir) {
     ShaderObjectPtr* shader;
   } passes[] = {
       {L"downsample_first", &downsample_first},
+      {L"downsample_first_16f", &downsample_first_16f},
       {L"downsample", &downsample},
       {L"upsample_add", &upsample_add},
       {L"composite", &composite},
+      {L"composite_16f", &composite_16f},
   };
   for (const auto& pass : passes) {
     const std::wstring base = dir + L"OpenGlow_" + pass.name;
@@ -91,6 +101,7 @@ bool DXShaders::Load(DXContext& context, const std::wstring& dir) {
 
 bool DXBackend::DownsampleFirst(const Frame& src, const Plane& dst, float gain, float threshold,
                                 float knee) {
+  if (!PixelAligned(src)) return false;
   Params p;
   SetSource(p, src);
   p.dst_width = dst.width;
@@ -98,7 +109,9 @@ bool DXBackend::DownsampleFirst(const Frame& src, const Plane& dst, float gain, 
   p.scale = gain;
   p.threshold = threshold;
   p.knee = knee;
-  return Dispatch(device_, device_.shaders.downsample_first, p,
+  const auto& shader = src.half ? device_.shaders.downsample_first_16f
+                                : device_.shaders.downsample_first;
+  return Dispatch(device_, shader, p,
                   {{src.data}, {dst.data}}, dst.width, dst.height);
 }
 
@@ -123,11 +136,13 @@ bool DXBackend::UpsampleAdd(const Plane& src, const Plane& dst, float src_weight
                   {{src.data}, {dst.data}}, dst.width, dst.height);
 }
 
-bool DXBackend::Composite(const Frame& src, const Plane& glow, const Frame& dst,
-                          const float tint_bgr[3]) {
+bool DXBackend::Composite(const Frame& src, const Plane& glow, const Plane& next,
+                          float next_weight, const Frame& dst, const float tint_bgr[3]) {
+  // One shader variant reads and writes the same precision.
+  if (src.half != dst.half || !PixelAligned(src) || !PixelAligned(dst)) return false;
   Params p;
   SetSource(p, src);
-  p.dst_pitch = dst.pitch;
+  p.dst_pitch = dst.pitch / BytesPerPixel(dst);
   p.dst_half = dst.half ? 1 : 0;
   p.dst_width = dst.width;
   p.dst_height = dst.height;
@@ -136,8 +151,15 @@ bool DXBackend::Composite(const Frame& src, const Plane& glow, const Frame& dst,
   p.tint_b = tint_bgr[0];
   p.tint_g = tint_bgr[1];
   p.tint_r = tint_bgr[2];
-  return Dispatch(device_, device_.shaders.composite, p,
-                  {{src.data}, {glow.data}, {dst.data}},
+  if (next.data) {
+    p.next_width = next.width;
+    p.next_height = next.height;
+    p.next_weight = next_weight;
+  }
+  const auto& shader = src.half ? device_.shaders.composite_16f : device_.shaders.composite;
+  return Dispatch(device_, shader, p,
+                  // Without a next level the slot still needs a buffer; it isn't read.
+                  {{src.data}, {glow.data}, {dst.data}, {next.data ? next.data : glow.data}},
                   dst.width, dst.height);
 }
 

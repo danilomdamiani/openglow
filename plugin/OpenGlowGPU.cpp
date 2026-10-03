@@ -52,42 +52,6 @@ openglow_gpu::DXDevice* GetDXDevice(csSDK_uint32 index, const PrGPUDeviceInfo& i
   return g_dx_devices[index].get();
 }
 
-#if OPENGLOW_HAS_CUDA
-class CudaBackend : public openglow_gpu::Backend {
- public:
-  CudaBackend(PrSDKGPUDeviceSuite* suite, csSDK_uint32 device, void* stream)
-      : suite_(suite), device_(device), stream_(stream) {}
-
-  void* Allocate(std::size_t bytes) override {
-    void* memory = nullptr;
-    return suite_->AllocateDeviceMemory(device_, bytes, &memory) == suiteError_NoError ? memory
-                                                                                      : nullptr;
-  }
-  void Free(void* memory) override { suite_->FreeDeviceMemory(device_, memory); }
-
-  bool DownsampleFirst(const Frame& src, const Plane& dst, float gain, float threshold,
-                       float knee) override {
-    return openglow_gpu::CudaDownsampleFirst(src, dst, gain, threshold, knee, stream_);
-  }
-  bool Downsample(const Plane& src, const Plane& dst) override {
-    return openglow_gpu::CudaDownsample(src, dst, stream_);
-  }
-  bool UpsampleAdd(const Plane& src, const Plane& dst, float src_weight) override {
-    return openglow_gpu::CudaUpsampleAdd(src, dst, src_weight, stream_);
-  }
-  bool Composite(const Frame& src, const Plane& glow, const Frame& dst,
-                 const float tint_bgr[3]) override {
-    return openglow_gpu::CudaComposite(src, glow, dst, tint_bgr, stream_);
-  }
-  bool Finish() override { return openglow_gpu::CudaFinish(stream_); }
-
- private:
-  PrSDKGPUDeviceSuite* suite_;
-  csSDK_uint32 device_;
-  void* stream_;
-};
-#endif
-
 float ParamFloat(const PrParam& p) {
   switch (p.mType) {
     case kPrParamType_Float32:
@@ -183,7 +147,9 @@ class OpenGlowGPU : public PrGPUFilterBase {
     }
 #if OPENGLOW_HAS_CUDA
     else if (mDeviceInfo.outDeviceFramework == PrGPUDeviceFramework_CUDA) {
-      CudaBackend backend(mGPUDeviceSuite, mDeviceIndex, mDeviceInfo.outCommandQueueHandle);
+      openglow_gpu::CudaBackend backend(
+          mDeviceInfo.outCommandQueueHandle, [this](std::size_t bytes) { return AllocateDevice(bytes); },
+          [this](void* memory) { mGPUDeviceSuite->FreeDeviceMemory(mDeviceIndex, memory); });
       ok = openglow_gpu::RunGlow(backend, src, dst, params);
     }
 #endif

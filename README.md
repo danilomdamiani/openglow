@@ -81,7 +81,14 @@ cmake -S . -B build -DAE_SDK_ROOT=path/to/AfterEffectsSDK -DPREMIERE_SDK_ROOT=pa
 - DirectX 12 is always built. Its shader compiler (`dxc`) ships with the
   Windows SDK that Visual Studio installs.
 - CUDA is built when CMake finds the CUDA toolkit. Premiere uses CUDA on NVIDIA
-  cards. GTX 9xx/10xx cards need CUDA 12.x (CUDA 13 dropped them).
+  cards. GTX 9xx/10xx cards need CUDA 12.x (CUDA 13 dropped them). If the
+  Visual Studio generator doesn't find it (e.g. the toolkit was installed after
+  the shell was opened), configure a fresh build folder with
+  `-T cuda="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.9"`.
+
+`openglow_gpu_dx_test` and `openglow_gpu_cuda_test` (run by `ctest`) render
+the same frames on the GPU and the CPU, compare them and time 1080p/4K;
+`--profile` prints the time of each pass.
 
 Premiere dropped OpenCL in 2021, so there is no OpenCL path.
 

@@ -2,19 +2,25 @@
 // pass, each compiled to its own .cso. The math mirrors core/src/glow.cpp line
 // by line (see GlowGpu.h for the order of the passes); keep them in sync.
 //
-// Frames are Premiere's BGRA 32f or 16f buffers (straight alpha) with a pitch
-// in bytes.
+// Frames are Premiere's BGRA 32f or 16f buffers (straight alpha). The passes
+// that touch frames are compiled twice, with HALF_FRAMES 0 and 1 ("_16f").
 // Pyramid levels are tightly packed float4 BGRA planes.
 //
-// 16f is read with f16tof32 rather than native half types, which older GPUs
-// (e.g. Pascal) don't support in D3D12.
+// Buffers are structured (one element per pixel) rather than byte-address:
+// a raw Load4 only promises 4-byte alignment, which some GPUs (e.g. Pascal)
+// split into four loads. 16f is read with f16tof32 rather than native half
+// types, which older GPUs don't support in D3D12.
+
+#ifndef HALF_FRAMES
+#define HALF_FRAMES 0
+#endif
 
 cbuffer Params : register(b0) {
-  int src_pitch;  // bytes
-  int src_half;
+  int src_pitch;  // pixels
+  int src_half;   // informational: the shader variant decides
   int src_width;
   int src_height;
-  int dst_pitch;  // bytes
+  int dst_pitch;  // pixels
   int dst_half;
   int dst_width;
   int dst_height;
@@ -26,16 +32,30 @@ cbuffer Params : register(b0) {
   float tint_r;
   float threshold;  // bright pass in linear light, 0 = off
   float knee;
+  int next_width;  // composite: level 1, added to level 0 on the fly; 0 = none
+  int next_height;
+  float next_weight;
 };
 
-RWByteAddressBuffer buf0 : register(u0);
-RWByteAddressBuffer buf1 : register(u1);
-RWByteAddressBuffer buf2 : register(u2);
+#if HALF_FRAMES
+typedef uint2 FramePixel;  // four packed halves
+#else
+typedef float4 FramePixel;
+#endif
+
+// Frames live in space1, pyramid planes in space0.
+RWStructuredBuffer<FramePixel> src_frame : register(u0, space1);
+RWStructuredBuffer<FramePixel> dst_frame : register(u1, space1);
+RWStructuredBuffer<float4> plane_a : register(u0);  // source level / glow
+RWStructuredBuffer<float4> plane_b : register(u1);  // destination level
+RWStructuredBuffer<float4> plane_c : register(u2);  // composite: next level
 
 // Parameters are root constants and buffers root UAVs: nothing to allocate
-// per dispatch. Root parameter order: constants, u0, u1[, u2].
-#define ROOT_2 "RootConstants(num32BitConstants = 16, b0), UAV(u0), UAV(u1)"
-#define ROOT_3 "RootConstants(num32BitConstants = 16, b0), UAV(u0), UAV(u1), UAV(u2)"
+// per dispatch. The root parameter order is the order the host binds buffers.
+#define CONSTANTS "RootConstants(num32BitConstants = 19, b0)"
+#define ROOT_FIRST CONSTANTS ", UAV(u0, space = 1), UAV(u1)"
+#define ROOT_PLANES CONSTANTS ", UAV(u0), UAV(u1)"
+#define ROOT_COMPOSITE CONSTANTS ", UAV(u0, space = 1), UAV(u0), UAV(u1, space = 1), UAV(u2)"
 
 static const float kTent[4] = {1.0f / 8, 3.0f / 8, 3.0f / 8, 1.0f / 8};
 
@@ -51,30 +71,40 @@ float3 bright_pass(float3 c, float t, float k) {
   return c * contrib;
 }
 
-float4 load_frame(RWByteAddressBuffer b, int pitch, int half_float, int x, int y) {
-  if (half_float) {
-    const uint2 v = b.Load2(pitch * y + 8 * x);
-    return float4(f16tof32(v.x), f16tof32(v.x >> 16), f16tof32(v.y), f16tof32(v.y >> 16));
-  }
-  return asfloat(b.Load4(pitch * y + 16 * x));
+float4 unpack(FramePixel v) {
+#if HALF_FRAMES
+  return float4(f16tof32(v.x), f16tof32(v.x >> 16), f16tof32(v.y), f16tof32(v.y >> 16));
+#else
+  return v;
+#endif
 }
 
-void store_frame(RWByteAddressBuffer b, int pitch, int half_float, int x, int y, float4 p) {
-  if (half_float) {
-    b.Store2(pitch * y + 8 * x, uint2(f32tof16(p.x) | (f32tof16(p.y) << 16),
-                                      f32tof16(p.z) | (f32tof16(p.w) << 16)));
-  } else {
-    b.Store4(pitch * y + 16 * x, asuint(p));
-  }
+FramePixel pack(float4 p) {
+#if HALF_FRAMES
+  return uint2(f32tof16(p.x) | (f32tof16(p.y) << 16), f32tof16(p.z) | (f32tof16(p.w) << 16));
+#else
+  return p;
+#endif
 }
 
-float4 load_plane(RWByteAddressBuffer b, int width, int x, int y) {
-  return asfloat(b.Load4(16 * (y * width + x)));
-}
+float4 load_src(int x, int y) { return unpack(src_frame[y * src_pitch + x]); }
+void store_dst(int x, int y, float4 p) { dst_frame[y * dst_pitch + x] = pack(p); }
 
-void store_plane(RWByteAddressBuffer b, int width, int x, int y, float4 p) {
-  b.Store4(16 * (y * width + x), asuint(p));
-}
+// Each group of 16x16 threads computes 16x16 outputs. Neighbouring outputs
+// read overlapping inputs, so the group first loads its input footprint into
+// groupshared memory once (UAV reads may bypass the L1 cache), then filters
+// from there. The arithmetic is unchanged.
+#define GROUP 16
+
+// 4x4 tent at stride 2: 16 outputs read 2 * 16 + 2 = 34 inputs per axis,
+// starting one pixel before twice the group's first output.
+#define DOWN_TILE 34
+groupshared float3 g_first[DOWN_TILE * DOWN_TILE];
+groupshared float4 g_down[DOWN_TILE * DOWN_TILE];
+
+// 2x bilinear: 16 outputs read source indices 8g - 1 .. 8g + 8.
+#define UP_TILE 10
+groupshared float4 g_up[UP_TILE * UP_TILE];
 
 // Bilinear tap for an exact 2x upsample (make_taps in glow.cpp).
 void tap(int d, int src_size, out int i0, out int i1, out float f) {
@@ -85,78 +115,138 @@ void tap(int d, int src_size, out int i0, out int i1, out float f) {
   f = s - si;
 }
 
-float4 bilinear(RWByteAddressBuffer b, int sw, int sh, int x, int y) {
+// Loads the plane_a footprint of this group's 2x upsample into g_up.
+// Returns the source index of g_up[0] (per axis).
+int2 load_up_tile(uint3 group, uint index, int sw, int sh) {
+  const int2 base = int2(group.xy) * (GROUP / 2) - 1;
+  if (index < UP_TILE * UP_TILE) {
+    const int sx = clamp(base.x + (int)(index % UP_TILE), 0, sw - 1);
+    const int sy = clamp(base.y + (int)(index / UP_TILE), 0, sh - 1);
+    g_up[index] = plane_a[sy * sw + sx];
+  }
+  GroupMemoryBarrierWithGroupSync();
+  return base;
+}
+
+// Plain 2x bilinear of plane_c from memory (for a few samples only).
+float4 bilinear_c(int sw, int sh, int x, int y) {
   int x0, x1, y0, y1;
   float fx, fy;
   tap(x, sw, x0, x1, fx);
   tap(y, sh, y0, y1, fy);
-  const float4 a = load_plane(b, sw, x0, y0), bb = load_plane(b, sw, x1, y0);
-  const float4 c = load_plane(b, sw, x0, y1), d = load_plane(b, sw, x1, y1);
-  const float4 top = a + (bb - a) * fx;
+  const float4 a = plane_c[y0 * sw + x0], b = plane_c[y0 * sw + x1];
+  const float4 c = plane_c[y1 * sw + x0], d = plane_c[y1 * sw + x1];
+  const float4 top = a + (b - a) * fx;
   const float4 bot = c + (d - c) * fx;
   return top + (bot - top) * fy;
 }
 
-// Frame (u0) -> pyramid level 0 (u1): linearize, bright pass, weight by
+// Level 0 for the composite: like load_up_tile, but each sample first gets
+// its upsample_add from the next level (same arithmetic as upsample_add).
+int2 load_collapsed_tile(uint3 group, uint index, int sw, int sh) {
+  if (next_width == 0) return load_up_tile(group, index, sw, sh);
+  const int2 base = int2(group.xy) * (GROUP / 2) - 1;
+  if (index < UP_TILE * UP_TILE) {
+    const int sx = clamp(base.x + (int)(index % UP_TILE), 0, sw - 1);
+    const int sy = clamp(base.y + (int)(index / UP_TILE), 0, sh - 1);
+    const float4 up = bilinear_c(next_width, next_height, sx, sy) * next_weight;
+    g_up[index] = plane_a[sy * sw + sx] + up;
+  }
+  GroupMemoryBarrierWithGroupSync();
+  return base;
+}
+
+float4 bilinear_up(int2 base, int sw, int sh, int x, int y) {
+  int x0, x1, y0, y1;
+  float fx, fy;
+  tap(x, sw, x0, x1, fx);
+  tap(y, sh, y0, y1, fy);
+  x0 -= base.x;
+  x1 -= base.x;
+  y0 -= base.y;
+  y1 -= base.y;
+  const float4 a = g_up[y0 * UP_TILE + x0], b = g_up[y0 * UP_TILE + x1];
+  const float4 c = g_up[y1 * UP_TILE + x0], d = g_up[y1 * UP_TILE + x1];
+  const float4 top = a + (b - a) * fx;
+  const float4 bot = c + (d - c) * fx;
+  return top + (bot - top) * fy;
+}
+
+// Frame -> pyramid level 0 (plane_b): linearize, bright pass, weight by
 // (straight) alpha, apply exposure, 4x4 tent.
-[RootSignature(ROOT_2)]
-[numthreads(16, 16, 1)]
-void downsample_first(uint3 id : SV_DispatchThreadID) {
-  const int x = id.x, y = id.y;
+[RootSignature(ROOT_FIRST)]
+[numthreads(GROUP, GROUP, 1)]
+void downsample_first(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID,
+                      uint index : SV_GroupIndex) {
+  const int2 base = int2(group.xy) * (2 * GROUP) - 1;
+  for (uint k = index; k < DOWN_TILE * DOWN_TILE; k += GROUP * GROUP) {
+    const int sx = clamp(base.x + (int)(k % DOWN_TILE), 0, src_width - 1);
+    const int sy = clamp(base.y + (int)(k / DOWN_TILE), 0, src_height - 1);
+    const float4 p = load_src(sx, sy);
+    float3 c = float3(to_linear(p.x), to_linear(p.y), to_linear(p.z));
+    if (threshold > 0.0f) c = bright_pass(c, threshold, knee);
+    g_first[k] = float3(c.x * p.w * scale, c.y * p.w * scale, c.z * p.w * scale);
+  }
+  GroupMemoryBarrierWithGroupSync();
+
+  const int x = group.x * GROUP + local.x, y = group.y * GROUP + local.y;
   if (x >= dst_width || y >= dst_height) return;
-  float4 acc = 0;
+  float3 acc = 0;
   for (int j = 0; j < 4; ++j) {
-    const int sy = clamp(2 * y - 1 + j, 0, src_height - 1);
     for (int i = 0; i < 4; ++i) {
-      const int sx = clamp(2 * x - 1 + i, 0, src_width - 1);
       const float w = kTent[j] * kTent[i];
-      const float4 p = load_frame(buf0, src_pitch, src_half, sx, sy);
-      float3 c = float3(to_linear(p.x), to_linear(p.y), to_linear(p.z));
-      if (threshold > 0.0f) c = bright_pass(c, threshold, knee);
-      acc.x += w * (c.x * p.w * scale);
-      acc.y += w * (c.y * p.w * scale);
-      acc.z += w * (c.z * p.w * scale);
+      acc += w * g_first[(2 * local.y + j) * DOWN_TILE + 2 * local.x + i];
     }
   }
-  acc.w = 0.0f;
-  store_plane(buf1, dst_width, x, y, acc);
+  plane_b[y * dst_width + x] = float4(acc, 0.0f);
 }
 
-// Pyramid level (u0) -> next level (u1), 4x4 tent.
-[RootSignature(ROOT_2)]
-[numthreads(16, 16, 1)]
-void downsample(uint3 id : SV_DispatchThreadID) {
-  const int x = id.x, y = id.y;
+// Pyramid level (plane_a) -> next level (plane_b), 4x4 tent.
+[RootSignature(ROOT_PLANES)]
+[numthreads(GROUP, GROUP, 1)]
+void downsample(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID,
+                uint index : SV_GroupIndex) {
+  const int2 base = int2(group.xy) * (2 * GROUP) - 1;
+  for (uint k = index; k < DOWN_TILE * DOWN_TILE; k += GROUP * GROUP) {
+    const int sx = clamp(base.x + (int)(k % DOWN_TILE), 0, src_width - 1);
+    const int sy = clamp(base.y + (int)(k / DOWN_TILE), 0, src_height - 1);
+    g_down[k] = plane_a[sy * src_width + sx];
+  }
+  GroupMemoryBarrierWithGroupSync();
+
+  const int x = group.x * GROUP + local.x, y = group.y * GROUP + local.y;
   if (x >= dst_width || y >= dst_height) return;
   float4 acc = 0;
   for (int j = 0; j < 4; ++j) {
-    const int sy = clamp(2 * y - 1 + j, 0, src_height - 1);
     for (int i = 0; i < 4; ++i) {
-      const int sx = clamp(2 * x - 1 + i, 0, src_width - 1);
-      acc += (kTent[j] * kTent[i]) * load_plane(buf0, src_width, sx, sy);
+      acc += (kTent[j] * kTent[i]) * g_down[(2 * local.y + j) * DOWN_TILE + 2 * local.x + i];
     }
   }
-  store_plane(buf1, dst_width, x, y, acc);
+  plane_b[y * dst_width + x] = acc;
 }
 
-// dst (u1) += upsample(src (u0)) * scale.
-[RootSignature(ROOT_2)]
-[numthreads(16, 16, 1)]
-void upsample_add(uint3 id : SV_DispatchThreadID) {
-  const int x = id.x, y = id.y;
+// plane_b += upsample(plane_a) * scale.
+[RootSignature(ROOT_PLANES)]
+[numthreads(GROUP, GROUP, 1)]
+void upsample_add(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID,
+                  uint index : SV_GroupIndex) {
+  const int2 base = load_up_tile(group, index, src_width, src_height);
+  const int x = group.x * GROUP + local.x, y = group.y * GROUP + local.y;
   if (x >= dst_width || y >= dst_height) return;
-  const float4 up = bilinear(buf0, src_width, src_height, x, y) * scale;
-  store_plane(buf1, dst_width, x, y, load_plane(buf1, dst_width, x, y) + up);
+  const float4 up = bilinear_up(base, src_width, src_height, x, y) * scale;
+  plane_b[y * dst_width + x] = plane_b[y * dst_width + x] + up;
 }
 
-// Source frame (u0) + upsampled glow (u1) -> output frame (u2).
-[RootSignature(ROOT_3)]
-[numthreads(16, 16, 1)]
-void composite(uint3 id : SV_DispatchThreadID) {
-  const int x = id.x, y = id.y;
+// Source frame + upsampled glow (plane_a) -> output frame.
+[RootSignature(ROOT_COMPOSITE)]
+[numthreads(GROUP, GROUP, 1)]
+void composite(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID,
+               uint index : SV_GroupIndex) {
+  const int2 base = load_collapsed_tile(group, index, glow_width, glow_height);
+  const int x = group.x * GROUP + local.x, y = group.y * GROUP + local.y;
   if (x >= dst_width || y >= dst_height) return;
-  const float4 g = bilinear(buf1, glow_width, glow_height, x, y);
-  const float4 p = load_frame(buf0, src_pitch, src_half, x, y);
+  const float4 g = bilinear_up(base, glow_width, glow_height, x, y);
+  const float4 p = load_src(x, y);
   // Premultiplied source + glow; alpha grows by the glow's coverage (with
   // alpha 1 this is exactly source + glow).
   const float3 glow = float3(g.x * tint_b, g.y * tint_g, g.z * tint_r);
@@ -170,5 +260,5 @@ void composite(uint3 id : SV_DispatchThreadID) {
     q.z = to_gamma(premult.z / out_a);
   }
   q.w = out_a;
-  store_frame(buf2, dst_pitch, dst_half, x, y, q);
+  store_dst(x, y, q);
 }

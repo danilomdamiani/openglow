@@ -42,15 +42,24 @@ target_link_libraries(openglow_dx PUBLIC openglow_core d3d12 d3dcompiler)
 set(DX_ASSETS "${CMAKE_CURRENT_BINARY_DIR}/DirectX_Assets")
 set(HLSL_SOURCE "${CMAKE_CURRENT_LIST_DIR}/OpenGlow.hlsl")
 set(DX_SHADER_OUTPUTS "")
-foreach(pass downsample_first downsample upsample_add composite)
+# Passes that touch frames are also built for half-float frames ("_16f").
+foreach(shader downsample_first downsample_first:16f downsample upsample_add composite
+               composite:16f)
+  string(REPLACE ":" ";" parts "${shader}")
+  list(GET parts 0 pass)
   set(out "${DX_ASSETS}/OpenGlow_${pass}")
+  set(half 0)
+  if(shader MATCHES ":16f$")
+    set(out "${out}_16f")
+    set(half 1)
+  endif()
   add_custom_command(
     OUTPUT "${out}.cso" "${out}.rs"
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${DX_ASSETS}"
-    COMMAND "${DXC}" -nologo -T cs_6_0 -E ${pass} -Fo "${out}.cso" -Frs "${out}.rs"
-            "${HLSL_SOURCE}"
+    COMMAND "${DXC}" -nologo -T cs_6_0 -E ${pass} -D HALF_FRAMES=${half} -Fo "${out}.cso"
+            -Frs "${out}.rs" "${HLSL_SOURCE}"
     DEPENDS "${HLSL_SOURCE}"
-    COMMENT "Compiling DirectX shader ${pass}"
+    COMMENT "Compiling DirectX shader ${shader}"
     VERBATIM
   )
   list(APPEND DX_SHADER_OUTPUTS "${out}.cso" "${out}.rs")
@@ -73,12 +82,15 @@ if(CMAKE_CUDA_COMPILER)
   # PTX for the newest listed architecture covers later cards.
   if(CUDAToolkit_VERSION VERSION_LESS 13)
     set(_cuda_archs "52;61;75;86;89-virtual")
+    target_compile_options(openglow_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Wno-deprecated-gpu-targets>)
   else()
     set(_cuda_archs "75;86;89;120-virtual")
   endif()
   set_target_properties(openglow_cuda PROPERTIES CUDA_ARCHITECTURES "${_cuda_archs}")
   target_include_directories(openglow_cuda PRIVATE "${CMAKE_CURRENT_LIST_DIR}")
   target_link_libraries(openglow_cuda PUBLIC openglow_core CUDA::cudart_static)
+  # cudart_static.lib asks for the static CRT; everything else uses the DLL one.
+  target_link_options(openglow_cuda INTERFACE /NODEFAULTLIB:LIBCMT)
   target_link_libraries(openglow_gpu PRIVATE openglow_cuda)
   target_compile_definitions(openglow_gpu PRIVATE OPENGLOW_HAS_CUDA=1)
   message(STATUS "OpenGlow: GPU renderer with DirectX 12 and CUDA ${CUDAToolkit_VERSION}")
@@ -104,4 +116,12 @@ if(OPENGLOW_BUILD_TESTS)
   add_dependencies(openglow_gpu_dx_test openglow_shaders)
   add_test(NAME openglow_gpu_dx_test COMMAND openglow_gpu_dx_test "${DX_ASSETS}/")
   set_tests_properties(openglow_gpu_dx_test PROPERTIES SKIP_RETURN_CODE 77)
+
+  if(TARGET openglow_cuda)
+    add_executable(openglow_gpu_cuda_test "${PROJECT_SOURCE_DIR}/tests/gpu_cuda_test.cpp")
+    target_include_directories(openglow_gpu_cuda_test PRIVATE "${CMAKE_CURRENT_LIST_DIR}")
+    target_link_libraries(openglow_gpu_cuda_test PRIVATE openglow_cuda)
+    add_test(NAME openglow_gpu_cuda_test COMMAND openglow_gpu_cuda_test)
+    set_tests_properties(openglow_gpu_cuda_test PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
 endif()

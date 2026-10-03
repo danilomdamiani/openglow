@@ -3,6 +3,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <thread>
 #include <vector>
 
 static int failures = 0;
@@ -303,6 +304,25 @@ void test_tiny_and_odd_sizes() {
   }
 }
 
+void test_concurrent_renders_match() {
+  // Hosts render several frames at once; they share the worker threads.
+  Image src = opaque(320, 180);
+  for (int i = 0; i < 40; ++i) src.at((i * 37) % 320, (i * 23) % 180)[i % 3] = 4.0f;
+  openglow::GlowParams p;
+  p.radius = 300;
+  p.threshold = 0.3f;
+  const Image expected = render(src, p);
+  std::vector<Image> results(6, Image(320, 180));
+  std::vector<std::thread> threads;
+  for (auto& r : results) {
+    threads.emplace_back([&] {
+      for (int k = 0; k < 5; ++k) openglow::render_glow(src.cview(), r.view(), p);
+    });
+  }
+  for (auto& t : threads) t.join();
+  for (const auto& r : results) CHECK(r.px == expected.px);
+}
+
 void test_padded_rows_are_left_alone() {
   Image src(20, 10, 3);
   Image dst(20, 10, 9);
@@ -332,6 +352,7 @@ int main() {
   test_in_place_matches_separate_buffers();
   test_tiny_and_odd_sizes();
   test_padded_rows_are_left_alone();
+  test_concurrent_renders_match();
   if (failures) {
     std::fprintf(stderr, "%d check(s) failed\n", failures);
     return 1;

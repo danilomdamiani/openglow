@@ -1,26 +1,16 @@
-// Runs the DirectX 12 glow on the local GPU and compares it with the CPU core,
-// for 32f and 16f frames, padded pitches, in-place renders and edge-case
-// radii. Then times a 1080p and a 4K frame. Exits 77 (skipped) when there is
-// no DirectX 12 hardware device.
+// Runs the DirectX 12 glow on the local GPU and compares it with the CPU core
+// (see gpu_test_common.h). Exits 77 (skipped) when there is no DirectX 12
+// hardware device.
 //
 // Usage: openglow_gpu_dx_test <DirectX_Assets dir with trailing slash>
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <wrl.h>
-#include <DirectXPackedVector.h>
 
-#include <algorithm>
-#include <chrono>
-#include <cmath>
-#include <cstdio>
-#include <cstring>
-#include <map>
 #include <string>
-#include <vector>
 
 #include "GlowDX.h"
-#include "GlowGpu.h"
-#include "openglow/glow.h"
+#include "gpu_test_common.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -28,17 +18,9 @@ namespace {
 
 constexpr int kSkip = 77;
 
-struct Gpu {
-  ComPtr<ID3D12Device> device;
-  ComPtr<ID3D12CommandQueue> queue;
-  ComPtr<ID3D12CommandAllocator> allocator;
-  ComPtr<ID3D12GraphicsCommandList> list;
-  ComPtr<ID3D12Fence> fence;
-  UINT64 fence_value = 0;
-  HANDLE event = nullptr;
-  std::string adapter;
-
-  bool Init() {
+class DXApi : public gpu_test::GpuApi {
+ public:
+  bool Init(const std::string& shader_dir) {
     ComPtr<IDXGIFactory6> factory;
     if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)))) return false;
     ComPtr<IDXGIAdapter1> a;
@@ -49,33 +31,80 @@ struct Gpu {
       DXGI_ADAPTER_DESC1 desc;
       a->GetDesc1(&desc);
       if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
-      if (SUCCEEDED(D3D12CreateDevice(a.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)))) {
-        char name[128];
-        std::snprintf(name, sizeof(name), "%ls", desc.Description);
-        adapter = name;
+      if (SUCCEEDED(D3D12CreateDevice(a.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device_)))) {
+        std::printf("device: %ls\n", desc.Description);
         break;
       }
     }
-    if (!device) return false;
+    if (!device_) return false;
     // DXContext records compute command lists, like Premiere's queue.
     D3D12_COMMAND_QUEUE_DESC qd = {};
     qd.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
-    if (FAILED(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue)))) return false;
-    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE,
-                                              IID_PPV_ARGS(&allocator)))) {
+    if (FAILED(device_->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue_)))) return false;
+    if (FAILED(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE,
+                                               IID_PPV_ARGS(&allocator_)))) {
       return false;
     }
-    if (FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, allocator.Get(),
-                                         nullptr, IID_PPV_ARGS(&list)))) {
+    if (FAILED(device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, allocator_.Get(),
+                                          nullptr, IID_PPV_ARGS(&list_)))) {
       return false;
     }
-    list->Close();
-    if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) return false;
-    event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    list_->Close();
+    if (FAILED(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_)))) return false;
+    event_ = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+
+    dx_.context = std::make_shared<DXContext>();
+    if (!dx_.context->Initialize(device_.Get(), queue_.Get())) {
+      std::printf("FAIL: DXContext::Initialize\n");
+      return false;
+    }
+    if (!dx_.shaders.Load(*dx_.context, std::wstring(shader_dir.begin(), shader_dir.end()))) {
+      std::printf("FAIL: could not load shaders from %s\n", shader_dir.c_str());
+      return false;
+    }
     return true;
   }
 
-  ID3D12Resource* CreateBuffer(std::size_t bytes, D3D12_HEAP_TYPE heap) {
+  bool HasDevice() const { return device_ != nullptr; }
+
+  const char* Name() const override { return "DirectX 12"; }
+
+  void* CreateBuffer(std::size_t bytes) override { return Create(bytes, D3D12_HEAP_TYPE_DEFAULT); }
+  void DestroyBuffer(void* buffer) override { static_cast<ID3D12Resource*>(buffer)->Release(); }
+
+  void Upload(void* dst, const void* data, std::size_t bytes) override {
+    ComPtr<ID3D12Resource> staging;
+    staging.Attach(Create(bytes, D3D12_HEAP_TYPE_UPLOAD));
+    void* p = nullptr;
+    staging->Map(0, nullptr, &p);
+    std::memcpy(p, data, bytes);
+    staging->Unmap(0, nullptr);
+    allocator_->Reset();
+    list_->Reset(allocator_.Get(), nullptr);
+    list_->CopyBufferRegion(static_cast<ID3D12Resource*>(dst), 0, staging.Get(), 0, bytes);
+    Submit();
+  }
+
+  void Download(void* src, void* data, std::size_t bytes) override {
+    ComPtr<ID3D12Resource> staging;
+    staging.Attach(Create(bytes, D3D12_HEAP_TYPE_READBACK));
+    allocator_->Reset();
+    list_->Reset(allocator_.Get(), nullptr);
+    list_->CopyBufferRegion(staging.Get(), 0, static_cast<ID3D12Resource*>(src), 0, bytes);
+    Submit();
+    void* p = nullptr;
+    staging->Map(0, nullptr, &p);
+    std::memcpy(data, p, bytes);
+    staging->Unmap(0, nullptr);
+  }
+
+  std::unique_ptr<openglow_gpu::Backend> MakeBackend(std::function<void*(std::size_t)> allocate,
+                                                     std::function<void(void*)> free) override {
+    return std::make_unique<openglow_gpu::DXBackend>(dx_, std::move(allocate), std::move(free));
+  }
+
+ private:
+  ID3D12Resource* Create(std::size_t bytes, D3D12_HEAP_TYPE heap) {
     D3D12_HEAP_PROPERTIES hp = {};
     hp.Type = heap;
     D3D12_RESOURCE_DESC rd = {};
@@ -91,238 +120,136 @@ struct Gpu {
     if (heap == D3D12_HEAP_TYPE_UPLOAD) state = D3D12_RESOURCE_STATE_GENERIC_READ;
     if (heap == D3D12_HEAP_TYPE_READBACK) state = D3D12_RESOURCE_STATE_COPY_DEST;
     ID3D12Resource* r = nullptr;
-    device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, state, nullptr,
-                                    IID_PPV_ARGS(&r));
+    device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, state, nullptr,
+                                     IID_PPV_ARGS(&r));
     return r;
   }
 
   void Submit() {
-    list->Close();
-    ID3D12CommandList* lists[] = {list.Get()};
-    queue->ExecuteCommandLists(1, lists);
-    queue->Signal(fence.Get(), ++fence_value);
-    fence->SetEventOnCompletion(fence_value, event);
-    WaitForSingleObject(event, INFINITE);
+    list_->Close();
+    ID3D12CommandList* lists[] = {list_.Get()};
+    queue_->ExecuteCommandLists(1, lists);
+    queue_->Signal(fence_.Get(), ++fence_value_);
+    fence_->SetEventOnCompletion(fence_value_, event_);
+    WaitForSingleObject(event_, INFINITE);
   }
 
-  void Upload(ID3D12Resource* dst, const void* data, std::size_t bytes) {
-    ComPtr<ID3D12Resource> staging;
-    staging.Attach(CreateBuffer(bytes, D3D12_HEAP_TYPE_UPLOAD));
-    void* p = nullptr;
-    staging->Map(0, nullptr, &p);
-    std::memcpy(p, data, bytes);
-    staging->Unmap(0, nullptr);
-    allocator->Reset();
-    list->Reset(allocator.Get(), nullptr);
-    list->CopyBufferRegion(dst, 0, staging.Get(), 0, bytes);
-    Submit();
-  }
+ public:
+  ID3D12Device* device() const { return device_.Get(); }
+  ID3D12CommandQueue* queue() const { return queue_.Get(); }
+  openglow_gpu::DXDevice& dx() { return dx_; }
 
-  void Download(ID3D12Resource* src, void* data, std::size_t bytes) {
-    ComPtr<ID3D12Resource> staging;
-    staging.Attach(CreateBuffer(bytes, D3D12_HEAP_TYPE_READBACK));
-    allocator->Reset();
-    list->Reset(allocator.Get(), nullptr);
-    list->CopyBufferRegion(staging.Get(), 0, src, 0, bytes);
-    Submit();
-    void* p = nullptr;
-    staging->Map(0, nullptr, &p);
-    std::memcpy(data, p, bytes);
-    staging->Unmap(0, nullptr);
-  }
+ private:
+  ComPtr<ID3D12Device> device_;
+  ComPtr<ID3D12CommandQueue> queue_;
+  ComPtr<ID3D12CommandAllocator> allocator_;
+  ComPtr<ID3D12GraphicsCommandList> list_;
+  ComPtr<ID3D12Fence> fence_;
+  UINT64 fence_value_ = 0;
+  HANDLE event_ = nullptr;
+  openglow_gpu::DXDevice dx_;
 };
 
-float HalfToFloat(uint16_t h) { return DirectX::PackedVector::XMConvertHalfToFloat(h); }
-uint16_t FloatToHalf(float f) { return DirectX::PackedVector::XMConvertFloatToHalf(f); }
-
-// A BGRA host image with a padded pitch, as Premiere hands them out.
-struct HostFrame {
-  int width, height, pitch;  // pitch in bytes
-  bool half;
-  std::vector<uint8_t> bytes;
-
-  HostFrame(int w, int h, bool half_float, int pad)
-      : width(w), height(h), pitch(w * (half_float ? 8 : 16) + pad), half(half_float),
-        bytes(static_cast<std::size_t>(pitch) * h, 0) {}
-
-  float Get(int x, int y, int c) const {
-    const uint8_t* row = bytes.data() + static_cast<std::size_t>(pitch) * y;
-    if (half) return HalfToFloat(reinterpret_cast<const uint16_t*>(row)[x * 4 + c]);
-    return reinterpret_cast<const float*>(row)[x * 4 + c];
+// --profile: times each pass of a 4K render with GPU timestamps recorded into
+// the same command list as the passes.
+class ProfilingBackend : public openglow_gpu::Backend {
+ public:
+  ProfilingBackend(DXApi& api, openglow_gpu::Backend& inner) : api_(api), inner_(inner) {
+    D3D12_QUERY_HEAP_DESC qd = {};
+    qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    qd.Count = kMaxQueries;
+    api.device()->CreateQueryHeap(&qd, IID_PPV_ARGS(&heap_));
+    readback_.Attach(static_cast<ID3D12Resource*>(nullptr));
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = kMaxQueries * 8;
+    rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    api.device()->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                          IID_PPV_ARGS(&readback_));
+    api.queue()->GetTimestampFrequency(&frequency_);
   }
-  void Set(int x, int y, int c, float v) {
-    uint8_t* row = bytes.data() + static_cast<std::size_t>(pitch) * y;
-    if (half) {
-      reinterpret_cast<uint16_t*>(row)[x * 4 + c] = FloatToHalf(v);
-    } else {
-      reinterpret_cast<float*>(row)[x * 4 + c] = v;
+
+  void* Allocate(std::size_t bytes) override { return inner_.Allocate(bytes); }
+  void Free(void* memory) override { inner_.Free(memory); }
+  bool DownsampleFirst(const openglow_gpu::Frame& s, const openglow_gpu::Plane& d, float g,
+                       float t, float k) override {
+    return Timed("downsample_first", [&] { return inner_.DownsampleFirst(s, d, g, t, k); });
+  }
+  bool Downsample(const openglow_gpu::Plane& s, const openglow_gpu::Plane& d) override {
+    return Timed("downsample", [&] { return inner_.Downsample(s, d); });
+  }
+  bool UpsampleAdd(const openglow_gpu::Plane& s, const openglow_gpu::Plane& d, float w) override {
+    return Timed("upsample_add", [&] { return inner_.UpsampleAdd(s, d, w); });
+  }
+  bool Composite(const openglow_gpu::Frame& s, const openglow_gpu::Plane& g,
+                 const openglow_gpu::Plane& n, float nw, const openglow_gpu::Frame& d,
+                 const float t[3]) override {
+    return Timed("composite", [&] { return inner_.Composite(s, g, n, nw, d, t); });
+  }
+  bool Finish() override {
+    List()->ResolveQueryData(heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, next_, readback_.Get(),
+                             0);
+    const bool ok = inner_.Finish();
+    UINT64* ticks = nullptr;
+    readback_->Map(0, nullptr, reinterpret_cast<void**>(&ticks));
+    for (UINT i = 0; i < next_; i += 2) {
+      totals_[names_[i / 2]] += 1000.0 * (ticks[i + 1] - ticks[i]) / frequency_;
     }
+    readback_->Unmap(0, nullptr);
+    next_ = 0;
+    names_.clear();
+    return ok;
   }
+
+  void Print(int runs) {
+    for (auto& e : totals_) std::printf("  %-18s %6.3f ms\n", e.first.c_str(), e.second / runs);
+  }
+
+ private:
+  static constexpr UINT kMaxQueries = 128;
+
+  ID3D12GraphicsCommandList* List() { return api_.dx().context->mCommandList.Get(); }
+
+  template <typename Fn>
+  bool Timed(const char* name, Fn fn) {
+    List()->EndQuery(heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, next_++);
+    const bool ok = fn();
+    List()->EndQuery(heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, next_++);
+    names_.push_back(name);
+    return ok;
+  }
+
+  DXApi& api_;
+  openglow_gpu::Backend& inner_;
+  ComPtr<ID3D12QueryHeap> heap_;
+  ComPtr<ID3D12Resource> readback_;
+  UINT64 frequency_ = 1;
+  UINT next_ = 0;
+  std::vector<std::string> names_;
+  std::map<std::string, double> totals_;
 };
 
-// Dim gradient, a few hot spots (above 1.0, like 32-bit footage) and partial
-// alpha, so every term of the glow is exercised.
-HostFrame MakeFrame(int w, int h, bool half, int pad) {
-  HostFrame f(w, h, half, pad);
-  for (int y = 0; y < h; ++y) {
-    for (int x = 0; x < w; ++x) {
-      const float u = static_cast<float>(x) / w, v = static_cast<float>(y) / h;
-      float b = 0.1f * u, g = 0.2f * v, r = 0.05f + 0.1f * u * v;
-      const int cx = x % 97, cy = y % 61;
-      if (cx < 3 && cy < 3) {
-        r = 4.0f;
-        g = 2.5f;
-        b = 1.0f;
-      }
-      if ((x * 7 + y * 13) % 211 == 0) b = 3.0f;
-      f.Set(x, y, 0, b);
-      f.Set(x, y, 1, g);
-      f.Set(x, y, 2, r);
-      f.Set(x, y, 3, 0.5f + 0.5f * u);
-    }
-  }
-  return f;
-}
-
-// A title-like frame: transparent background (with garbage RGB, which must be
-// ignored), an opaque bright bar and a half-transparent disc.
-HostFrame MakeShapeFrame(int w, int h, bool half, int pad) {
-  HostFrame f(w, h, half, pad);
-  for (int y = 0; y < h; ++y) {
-    for (int x = 0; x < w; ++x) {
-      float b = 7.0f, g = 0.3f, r = 2.0f, a = 0.0f;
-      if (x > w / 4 && x < w / 2 && y > h / 3 && y < h / 2) {
-        b = 0.2f;
-        g = 0.7f;
-        r = 1.0f;
-        a = 1.0f;
-      }
-      const float dx = x - 0.7f * w, dy = y - 0.6f * h;
-      if (dx * dx + dy * dy < 0.01f * w * w) {
-        b = 1.5f;
-        g = 0.4f;
-        r = 0.1f;
-        a = 0.5f;
-      }
-      f.Set(x, y, 0, b);
-      f.Set(x, y, 1, g);
-      f.Set(x, y, 2, r);
-      f.Set(x, y, 3, a);
-    }
-  }
-  return f;
-}
-
-// CPU reference on exactly the values the GPU reads.
-std::vector<float> Reference(const HostFrame& in, const openglow::GlowParams& params) {
-  const std::size_t stride = static_cast<std::size_t>(in.width) * 4;
-  std::vector<float> src(stride * in.height), dst(stride * in.height);
-  for (int y = 0; y < in.height; ++y)
-    for (int x = 0; x < in.width; ++x)
-      for (int c = 0; c < 4; ++c) src[y * stride + x * 4 + c] = in.Get(x, y, c);
-  openglow::render_glow({src.data(), in.width, in.height, stride},
-                        {dst.data(), in.width, in.height, stride}, params, openglow::kBGRA);
-  return dst;
-}
-
-// Pools freed buffers by size, like Premiere's AllocateDeviceMemory does, so
-// the timings measure the glow rather than buffer creation.
-struct Harness {
-  Gpu gpu;
-  openglow_gpu::DXDevice device;
-  int live_buffers = 0;
-  std::multimap<std::size_t, ComPtr<ID3D12Resource>> pool;
-  std::map<void*, std::size_t> sizes;
-
-  openglow_gpu::DXBackend Backend() {
-    return openglow_gpu::DXBackend(
-        device,
-        [this](std::size_t bytes) -> void* {
-          ++live_buffers;
-          auto it = pool.find(bytes);
-          ComPtr<ID3D12Resource> r;
-          if (it != pool.end()) {
-            r = it->second;
-            pool.erase(it);
-          } else {
-            r.Attach(gpu.CreateBuffer(bytes, D3D12_HEAP_TYPE_DEFAULT));
-          }
-          sizes[r.Get()] = bytes;
-          return r.Detach();
-        },
-        [this](void* memory) {
-          --live_buffers;
-          ComPtr<ID3D12Resource> r;
-          r.Attach(static_cast<ID3D12Resource*>(memory));
-          pool.emplace(sizes[memory], r);
-        });
-  }
-};
-
-int failures = 0;
-
-void Check(Harness& h, const char* name, int w, int hgt, bool half, int pad, bool in_place,
-           const openglow::GlowParams& params, bool shapes = false) {
-  HostFrame in = shapes ? MakeShapeFrame(w, hgt, half, pad) : MakeFrame(w, hgt, half, pad);
-  ComPtr<ID3D12Resource> src_buf, dst_buf;
-  src_buf.Attach(h.gpu.CreateBuffer(in.bytes.size(), D3D12_HEAP_TYPE_DEFAULT));
-  h.gpu.Upload(src_buf.Get(), in.bytes.data(), in.bytes.size());
-  if (!in_place) {
-    dst_buf.Attach(h.gpu.CreateBuffer(in.bytes.size(), D3D12_HEAP_TYPE_DEFAULT));
-  }
-
-  openglow_gpu::Frame src{src_buf.Get(), w, hgt, in.pitch, half};
-  openglow_gpu::Frame dst = src;
-  if (!in_place) dst.data = dst_buf.Get();
-
-  auto backend = h.Backend();
-  const bool ok = openglow_gpu::RunGlow(backend, src, dst, params);
-
-  HostFrame out(w, hgt, half, pad);
-  h.gpu.Download(in_place ? src_buf.Get() : dst_buf.Get(), out.bytes.data(), out.bytes.size());
-  const std::vector<float> ref = Reference(in, params);
-
-  // 32f: float rounding only. 16f: the output is rounded to half too.
-  // Colors are compared premultiplied by alpha: where the glow barely covers a
-  // transparent pixel, its color is a ratio of tiny numbers and invisible.
-  const double tol = half ? 2e-3 : 2e-5;
-  double worst = 0;
-  for (int y = 0; y < hgt; ++y)
-    for (int x = 0; x < w; ++x) {
-      const float* r = &ref[(static_cast<std::size_t>(y) * w + x) * 4];
-      const double ra = r[3], oa = out.Get(x, y, 3);
-      for (int c = 0; c < 4; ++c) {
-        const double rv = c == 3 ? ra : r[c] * ra;
-        const double ov = c == 3 ? oa : out.Get(x, y, c) * oa;
-        worst = std::max(worst, std::fabs(ov - rv) / std::max(1.0, std::fabs(rv)));
-      }
-    }
-
-  const bool pass = ok && worst <= tol && h.live_buffers == 0;
-  if (!pass) ++failures;
-  std::printf("%-4s %-34s %4dx%-4d max rel err %.2e (tol %.0e)%s\n", pass ? "ok" : "FAIL",
-              name, w, hgt, worst, tol, ok ? "" : "  [dispatch failed]");
-}
-
-void Time(Harness& h, int w, int hgt) {
-  HostFrame in = MakeFrame(w, hgt, false, 0);
-  ComPtr<ID3D12Resource> buf;
-  buf.Attach(h.gpu.CreateBuffer(in.bytes.size(), D3D12_HEAP_TYPE_DEFAULT));
-  h.gpu.Upload(buf.Get(), in.bytes.data(), in.bytes.size());
-  openglow_gpu::Frame frame{buf.Get(), w, hgt, in.pitch, false};
-
-  for (float radius : {20.0f, 500.0f}) {
-    openglow::GlowParams params;
-    params.radius = radius;
-    auto backend = h.Backend();
-    openglow_gpu::RunGlow(backend, frame, frame, params);  // warm-up
-    const int runs = 20;
-    const auto t0 = std::chrono::steady_clock::now();
-    for (int i = 0; i < runs; ++i) openglow_gpu::RunGlow(backend, frame, frame, params);
-    const auto t1 = std::chrono::steady_clock::now();
-    std::printf("time %dx%d radius %4.0f: %7.2f ms/frame (DirectX 12, 32f)\n", w, hgt, radius,
-                std::chrono::duration<double, std::milli>(t1 - t0).count() / runs);
-  }
+void Profile(DXApi& api, int w, int h, bool half) {
+  gpu_test::HostFrame in = gpu_test::MakeFrame(w, h, half, 0);
+  void* buf = api.CreateBuffer(in.bytes.size());
+  api.Upload(buf, in.bytes.data(), in.bytes.size());
+  gpu_test::Runner runner(api);
+  auto inner = runner.Backend();
+  ProfilingBackend profiled(api, *inner);
+  openglow::GlowParams params;
+  params.radius = 500;
+  openglow_gpu::Frame frame{buf, w, h, in.pitch, half};
+  openglow_gpu::RunGlow(*inner, frame, frame, params);
+  const int runs = 20;
+  for (int i = 0; i < runs; ++i) openglow_gpu::RunGlow(profiled, frame, frame, params);
+  std::printf("profile %dx%d %s:\n", w, h, half ? "16f" : "32f");
+  profiled.Print(runs);
+  api.DestroyBuffer(buf);
 }
 
 }  // namespace
@@ -332,67 +259,19 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "usage: %s <DirectX_Assets dir>\n", argv[0]);
     return 2;
   }
-  Harness h;
-  if (!h.gpu.Init()) {
-    std::printf("no DirectX 12 hardware device, skipping\n");
-    return kSkip;
-  }
-  std::printf("device: %s\n", h.gpu.adapter.c_str());
-
-  h.device.context = std::make_shared<DXContext>();
-  if (!h.device.context->Initialize(h.gpu.device.Get(), h.gpu.queue.Get())) {
-    std::printf("FAIL: DXContext::Initialize\n");
+  DXApi api;
+  if (!api.Init(argv[1])) {
+    if (!api.HasDevice()) {
+      std::printf("no DirectX 12 hardware device, skipping\n");
+      return kSkip;
+    }
     return 1;
   }
-  std::string dir = argv[1];
-  if (!h.device.shaders.Load(*h.device.context, std::wstring(dir.begin(), dir.end()))) {
-    std::printf("FAIL: could not load shaders from %s\n", dir.c_str());
-    return 1;
+  if (argc > 2 && std::string(argv[2]) == "--profile") {
+    Profile(api, 3840, 2160, false);
+    Profile(api, 3840, 2160, true);
+    return 0;
   }
-
-  openglow::GlowParams base;
-  base.radius = 50;
-
-  openglow::GlowParams bright = base;
-  bright.exposure = 1.5f;
-  bright.radius = 137.3f;  // fractional last level
-  bright.tint = true;
-  bright.tint_color[0] = 1.0f;
-  bright.tint_color[1] = 0.45f;
-  bright.tint_color[2] = 0.1f;
-
-  openglow::GlowParams tiny = base;
-  tiny.radius = 1;  // a single level
-
-  openglow::GlowParams huge = base;
-  huge.radius = 2000;  // pyramid runs out of pixels
-
-  Check(h, "32f default", 301, 173, false, 0, false, base);
-  Check(h, "32f exposure+tint+fraction, padded", 301, 173, false, 48, false, bright);
-  Check(h, "32f radius 1", 64, 40, false, 0, false, tiny);
-  Check(h, "32f radius 2000", 257, 129, false, 16, false, huge);
-  Check(h, "32f in place", 200, 120, false, 32, true, bright);
-  Check(h, "16f default", 301, 173, true, 0, false, base);
-  Check(h, "16f exposure+tint, padded, in place", 299, 171, true, 24, true, bright);
-  Check(h, "32f 1080p", 1920, 1080, false, 0, false, bright);
-
-  openglow::GlowParams aura = base;
-  aura.radius = 400;
-  aura.exposure = 1.0f;
-  openglow::GlowParams thresholded = bright;
-  thresholded.threshold = 0.6f;
-  openglow::GlowParams thresholded_aura = aura;
-  thresholded_aura.threshold = 0.8f;
-
-  Check(h, "32f shapes on transparent", 320, 180, false, 0, false, aura, true);
-  Check(h, "16f shapes on transparent, in place", 320, 180, true, 16, true, aura, true);
-  Check(h, "32f threshold 0.6", 301, 173, false, 0, false, thresholded);
-  Check(h, "16f threshold 0.6, padded", 301, 173, true, 40, false, thresholded);
-  Check(h, "32f shapes + threshold 0.8", 320, 180, false, 0, false, thresholded_aura, true);
-
-  Time(h, 1920, 1080);
-  Time(h, 3840, 2160);
-
-  std::printf(failures ? "%d check(s) failed\n" : "all checks passed\n", failures);
-  return failures ? 1 : 0;
+  gpu_test::Runner runner(api);
+  return runner.RunAll();
 }

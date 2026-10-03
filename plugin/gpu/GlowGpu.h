@@ -4,8 +4,11 @@
 //
 //   downsample_first  frame -> level 0 (linearize, exposure, 4x4 tent)
 //   downsample        level k-1 -> level k
-//   upsample_add      level k += 2x bilinear(level k+1) [* last_weight once]
-//   composite         frame + tinted 2x bilinear(level 0) -> output frame
+//   upsample_add      level k += 2x bilinear(level k+1) [* last_weight once],
+//                     for k >= 1
+//   composite         frame + tinted 2x bilinear(level 0) -> output frame,
+//                     where level 0 also gets its upsample_add on the fly
+//                     (same arithmetic, without writing it back)
 #pragma once
 
 #include <cstddef>
@@ -47,9 +50,11 @@ class Backend {
                                float knee) = 0;
   virtual bool Downsample(const Plane& src, const Plane& dst) = 0;
   virtual bool UpsampleAdd(const Plane& src, const Plane& dst, float src_weight) = 0;
+  // glow is level 0. If next.data is set, each level-0 sample first gets
+  // upsample(next) * next_weight added, exactly as UpsampleAdd would.
   // tint_bgr already includes the 1/total normalization.
-  virtual bool Composite(const Frame& src, const Plane& glow, const Frame& dst,
-                         const float tint_bgr[3]) = 0;
+  virtual bool Composite(const Frame& src, const Plane& glow, const Plane& next,
+                         float next_weight, const Frame& dst, const float tint_bgr[3]) = 0;
   // Passes may be queued; this submits them and waits until the GPU is done,
   // so the pyramid can be freed. Called once per render, even after a failure.
   virtual bool Finish() = 0;
@@ -79,16 +84,18 @@ inline bool RunGlow(Backend& backend, const Frame& src, const Frame& dst,
   if (ok) ok = backend.DownsampleFirst(in, levels[0], plan.gain, plan.threshold, plan.knee);
   for (int k = 1; k < plan.levels && ok; ++k) ok = backend.Downsample(levels[k - 1], levels[k]);
   // The deepest level fades in by last_weight (the CPU scales it in place).
-  for (int k = plan.levels - 2; k >= 0 && ok; --k) {
-    const float weight = k == plan.levels - 2 ? plan.last_weight : 1.0f;
-    ok = backend.UpsampleAdd(levels[k + 1], levels[k], weight);
+  auto weight = [&](int k) { return k == plan.levels - 2 ? plan.last_weight : 1.0f; };
+  for (int k = plan.levels - 2; k >= 1 && ok; --k) {
+    ok = backend.UpsampleAdd(levels[k + 1], levels[k], weight(k));
   }
   if (ok) {
     // With a single level there is no upsample to carry last_weight (it is
     // always 1 then, but keep the math identical to the CPU).
     const float w = plan.levels == 1 ? plan.last_weight : 1.0f;
     const float tint_bgr[3] = {plan.tint[2] * w, plan.tint[1] * w, plan.tint[0] * w};
-    ok = backend.Composite(in, levels[0], out, tint_bgr);
+    const Plane none;
+    ok = backend.Composite(in, levels[0], plan.levels >= 2 ? levels[1] : none, weight(0), out,
+                           tint_bgr);
   }
   ok = backend.Finish() && ok;
 

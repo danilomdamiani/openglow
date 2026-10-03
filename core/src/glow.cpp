@@ -15,8 +15,13 @@
 #include "openglow/glow.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <condition_variable>
+#include <deque>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -57,35 +62,116 @@ struct Plane {
   }
 };
 
+// Persistent worker threads: a render runs about ten parallel passes, and
+// starting threads for each one cost more than some of the passes.
+//
+// Several renders may run at once (hosts render frames in parallel), so jobs
+// queue up; the caller of Run also works on its own job, so it always
+// finishes even when every worker is busy elsewhere.
+class ThreadPool {
+ public:
+  static ThreadPool& get() {
+    // Never destroyed: the workers stay parked until the process exits
+    // (joining threads while a plugin DLL unloads can deadlock).
+    static ThreadPool* pool = new ThreadPool(
+        std::max(1, static_cast<int>(std::thread::hardware_concurrency())) - 1);
+    return *pool;
+  }
+
+  int threads() const { return workers_ + 1; }
+
+  // Calls fn(i) for every i in [0, count), and returns when all are done.
+  void run(int count, const std::function<void(int)>& fn) {
+    Job job{&fn, count};
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      jobs_.push_back(&job);
+    }
+    work_.notify_all();
+    work_on(job);
+    std::unique_lock<std::mutex> lock(mutex_);
+    done_.wait(lock, [&] { return job.done.load() == count && job.users == 0; });
+    const auto it = std::find(jobs_.begin(), jobs_.end(), &job);
+    if (it != jobs_.end()) jobs_.erase(it);
+  }
+
+ private:
+  struct Job {
+    const std::function<void(int)>* fn;
+    int count;
+    std::atomic<int> next{0};
+    std::atomic<int> done{0};
+    int users = 0;  // workers holding a pointer to it, guarded by mutex_
+  };
+
+  explicit ThreadPool(int workers) : workers_(workers) {
+    for (int i = 0; i < workers; ++i) std::thread([this] { worker(); }).detach();
+  }
+
+  // Runs chunks of the job until none are left. Returns whether it ran any.
+  bool work_on(Job& job) {
+    bool any = false;
+    for (int i; (i = job.next.fetch_add(1)) < job.count;) {
+      (*job.fn)(i);
+      any = true;
+      if (job.done.fetch_add(1) + 1 == job.count) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        done_.notify_all();
+      }
+    }
+    return any;
+  }
+
+  void worker() {
+    for (;;) {
+      Job* job;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        work_.wait(lock, [&] { return !jobs_.empty(); });
+        job = jobs_.front();
+        ++job->users;
+      }
+      const bool ran = work_on(*job);
+      std::lock_guard<std::mutex> lock(mutex_);
+      // A job with nothing left to take leaves the queue for the next one.
+      if (!ran && !jobs_.empty() && jobs_.front() == job) jobs_.pop_front();
+      if (--job->users == 0) done_.notify_all();
+    }
+  }
+
+  const int workers_;
+  std::mutex mutex_;
+  std::condition_variable work_, done_;
+  std::deque<Job*> jobs_;
+};
+
 // Runs fn(y_begin, y_end) over [0, rows) on the available cores.
 template <typename Fn>
 void parallel_rows(int rows, Fn fn) {
-  static const int hw = std::max(1u, std::thread::hardware_concurrency());
-  // Small planes aren't worth a thread each.
-  const int threads = std::min(hw, std::max(1, rows / 32));
-  if (threads <= 1) {
+  ThreadPool& pool = ThreadPool::get();
+  // Small planes aren't worth splitting.
+  const int chunks = std::min(pool.threads(), std::max(1, rows / 32));
+  if (chunks <= 1) {
     fn(0, rows);
     return;
   }
-  std::vector<std::thread> pool;
-  pool.reserve(threads - 1);
-  const int chunk = (rows + threads - 1) / threads;
-  for (int t = 1; t < threads; ++t) {
-    const int begin = t * chunk;
+  const int chunk = (rows + chunks - 1) / chunks;
+  pool.run(chunks, [&](int i) {
+    const int begin = i * chunk;
     const int end = std::min(rows, begin + chunk);
-    if (begin < end) pool.emplace_back(fn, begin, end);
-  }
-  fn(0, std::min(rows, chunk));
-  for (auto& th : pool) th.join();
+    if (begin < end) fn(begin, end);
+  });
 }
 
 // Half-size downsample with a separable [1 3 3 1]/8 tent over a 4x4
 // footprint. Smooth enough that small bright points don't flicker.
-// load(p, out) reads one source pixel into RGBA.
-template <typename RowFn, typename LoadFn>
-void downsample(int sw, int sh, RowFn src_row, LoadFn load, Plane& dst) {
+// make_rows() is called once per thread and returns a function that gives
+// source row y as RGBA floats.
+template <typename MakeRows>
+void downsample(int sw, int sh, MakeRows make_rows, Plane& dst) {
   parallel_rows(dst.height, [&](int y0, int y1) {
     static const float k[4] = {1.0f / 8, 3.0f / 8, 3.0f / 8, 1.0f / 8};
+    auto src_row = make_rows();
     for (int y = y0; y < y1; ++y) {
       const float* rows[4];
       for (int j = 0; j < 4; ++j) rows[j] = src_row(std::clamp(2 * y - 1 + j, 0, sh - 1));
@@ -97,8 +183,7 @@ void downsample(int sw, int sh, RowFn src_row, LoadFn load, Plane& dst) {
         for (int j = 0; j < 4; ++j) {
           for (int i = 0; i < 4; ++i) {
             const float w = k[j] * k[i];
-            float p[4];
-            load(rows[j] + cols[i], p);
+            const float* p = rows[j] + cols[i];
             acc[0] += w * p[0];
             acc[1] += w * p[1];
             acc[2] += w * p[2];
@@ -116,16 +201,47 @@ void downsample(int sw, int sh, RowFn src_row, LoadFn load, Plane& dst) {
 
 void downsample(const Plane& src, Plane& dst) {
   downsample(
-      src.width, src.height, [&](int y) { return src.row(y); },
-      [](const float* p, float* out) {
-        out[0] = p[0];
-        out[1] = p[1];
-        out[2] = p[2];
-        out[3] = p[3];
-      },
-      dst);
+      src.width, src.height, [&] { return [&](int y) { return src.row(y); }; }, dst);
 }
 
+// Source rows for the first level, converted once each: linearize, keep what
+// passes the threshold, weight by alpha (only visible pixels emit light; RGB
+// under alpha 0 is ignored) and expose. Consecutive output rows share two of
+// their four source rows, so a ring of four converted rows is enough.
+class LinearRows {
+ public:
+  LinearRows(const ConstImageView& src, int width, ChannelOrder order, const GlowPlan& plan)
+      : src_(src), width_(width), order_(order), plan_(plan),
+        buffer_(static_cast<std::size_t>(width) * 4 * 4) {}
+
+  const float* operator()(int y) {
+    float* row = buffer_.data() + static_cast<std::size_t>(y & 3) * width_ * 4;
+    if (cached_[y & 3] != y) {
+      const float* in = src_.row(y);
+      for (int x = 0; x < width_; ++x) {
+        const float* p = in + x * 4;
+        float c[3] = {to_linear(p[order_.r]), to_linear(p[order_.g]), to_linear(p[order_.b])};
+        if (plan_.threshold > 0.0f) bright_pass(c, plan_.threshold, plan_.knee);
+        const float a = p[order_.a];
+        float* out = row + x * 4;
+        out[0] = c[0] * a * plan_.gain;
+        out[1] = c[1] * a * plan_.gain;
+        out[2] = c[2] * a * plan_.gain;
+        out[3] = 0.0f;
+      }
+      cached_[y & 3] = y;
+    }
+    return row;
+  }
+
+ private:
+  const ConstImageView& src_;
+  const int width_;
+  const ChannelOrder order_;
+  const GlowPlan& plan_;
+  std::vector<float> buffer_;
+  int cached_[4] = {-1, -1, -1, -1};
+};
 // Bilinear taps for a 2x upsample. Each level is exactly half of the one
 // above (odd sizes round up and clamp at the edge), so pixel centers line up
 // with a fixed factor of 2, not with the ratio of the sizes.
@@ -233,22 +349,10 @@ void render_glow(const ConstImageView& src, const ImageView& dst, const GlowPara
   pyramid.reserve(levels);
   for (int k = 0; k < levels; ++k) pyramid.emplace_back(plan.width[k], plan.height[k]);
 
-  // The first level reads the source directly, so no full-resolution copy is
-  // made: linearize, keep what passes the threshold, weight by alpha (only
-  // visible pixels emit light; RGB under alpha 0 is ignored) and expose.
-  const float gain = plan.gain, threshold = plan.threshold, knee = plan.knee;
+  // The first level reads the source directly (a few converted rows at a
+  // time), so no full-resolution copy is made.
   downsample(
-      width, height, [&](int y) { return src.row(y); },
-      [&](const float* p, float* out) {
-        float c[3] = {to_linear(p[order.r]), to_linear(p[order.g]), to_linear(p[order.b])};
-        if (threshold > 0.0f) bright_pass(c, threshold, knee);
-        const float a = p[order.a];
-        out[0] = c[0] * a * gain;
-        out[1] = c[1] * a * gain;
-        out[2] = c[2] * a * gain;
-        out[3] = 0.0f;
-      },
-      pyramid[0]);
+      width, height, [&] { return LinearRows(src, width, order, plan); }, pyramid[0]);
   for (int k = 1; k < levels; ++k) downsample(pyramid[k - 1], pyramid[k]);
 
   // Collapse: pyramid[k] = pyramid[k] + upsample(pyramid[k+1]). Scaling the

@@ -12,12 +12,15 @@
 namespace openglow_gpu {
 
 // Compiled kernels for one device. Files are "<dir>OpenGlow_<pass>.cso/.rs",
-// built from OpenGlow.hlsl.
+// built from OpenGlow.hlsl; passes that read or write frames have a "_16f"
+// variant for half-float frames.
 struct DXShaders {
   ShaderObjectPtr downsample_first;
+  ShaderObjectPtr downsample_first_16f;
   ShaderObjectPtr downsample;
   ShaderObjectPtr upsample_add;
   ShaderObjectPtr composite;
+  ShaderObjectPtr composite_16f;
 
   bool Load(DXContext& context, const std::wstring& dir);
 };
@@ -45,8 +48,8 @@ class DXBackend : public Backend {
                        float knee) override;
   bool Downsample(const Plane& src, const Plane& dst) override;
   bool UpsampleAdd(const Plane& src, const Plane& dst, float src_weight) override;
-  bool Composite(const Frame& src, const Plane& glow, const Frame& dst,
-                 const float tint_bgr[3]) override;
+  bool Composite(const Frame& src, const Plane& glow, const Plane& next, float next_weight,
+                 const Frame& dst, const float tint_bgr[3]) override;
   bool Finish() override;
 
  private:
