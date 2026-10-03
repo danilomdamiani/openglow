@@ -1,6 +1,7 @@
 // Minimal test runner: no framework, so CI stays fast on every platform.
 #include "openglow/glow.h"
 
+#include <cmath>
 #include <cstdio>
 #include <vector>
 
@@ -15,28 +16,238 @@ static int failures = 0;
     }                                                                 \
   } while (0)
 
-static void test_passthrough_copies_pixels_with_padded_rows() {
-  const int w = 7, h = 5;
-  const std::size_t src_stride = w * 4 + 3;  // padded rows, like host buffers
-  const std::size_t dst_stride = w * 4 + 9;
-  std::vector<float> src(src_stride * h, -1.0f);
-  std::vector<float> dst(dst_stride * h, 0.0f);
+namespace {
+
+struct Image {
+  int w, h;
+  std::size_t stride;
+  std::vector<float> px;
+
+  Image(int w_, int h_, std::size_t pad = 0)
+      : w(w_), h(h_), stride(w_ * 4 + pad), px(stride * h_, 0.0f) {}
+  float* at(int x, int y) { return &px[y * stride + x * 4]; }
+  const float* at(int x, int y) const { return &px[y * stride + x * 4]; }
+  openglow::ImageView view() { return {px.data(), w, h, stride}; }
+  openglow::ConstImageView cview() const { return {px.data(), w, h, stride}; }
+};
+
+Image opaque(int w, int h) {
+  Image img(w, h);
   for (int y = 0; y < h; ++y)
-    for (int x = 0; x < w * 4; ++x) src[y * src_stride + x] = static_cast<float>(y * 100 + x);
+    for (int x = 0; x < w; ++x) img.at(x, y)[3] = 1.0f;
+  return img;
+}
 
-  openglow::ConstImageView in{src.data(), w, h, src_stride};
-  openglow::ImageView out{dst.data(), w, h, dst_stride};
-  openglow::render_glow(in, out, openglow::GlowParams{});
+Image render(const Image& src, const openglow::GlowParams& p,
+             openglow::ChannelOrder order = openglow::kRGBA) {
+  Image dst(src.w, src.h);
+  openglow::render_glow(src.cview(), dst.view(), p, order);
+  return dst;
+}
 
-  for (int y = 0; y < h; ++y) {
-    for (int x = 0; x < w * 4; ++x) CHECK(dst[y * dst_stride + x] == src[y * src_stride + x]);
-    // Padding past the row must stay untouched.
-    for (std::size_t x = w * 4; x < dst_stride; ++x) CHECK(dst[y * dst_stride + x] == 0.0f);
+// Sum of squared (linear) red over the image, i.e. the light added.
+double linear_red_energy(const Image& img) {
+  double e = 0;
+  for (int y = 0; y < img.h; ++y)
+    for (int x = 0; x < img.w; ++x) e += img.at(x, y)[0] * img.at(x, y)[0];
+  return e;
+}
+
+void test_black_stays_black() {
+  Image src = opaque(64, 36);
+  Image dst = render(src, {});
+  for (int y = 0; y < dst.h; ++y)
+    for (int x = 0; x < dst.w; ++x) {
+      CHECK(dst.at(x, y)[0] == 0.0f);
+      CHECK(dst.at(x, y)[3] == 1.0f);
+    }
+}
+
+void test_bright_point_spreads_symmetrically() {
+  Image src = opaque(129, 129);
+  src.at(64, 64)[0] = src.at(64, 64)[1] = src.at(64, 64)[2] = 50.0f;
+  openglow::GlowParams p;
+  p.radius = 200;
+  Image dst = render(src, p);
+  // Glow reaches well away from the point...
+  CHECK(dst.at(64 + 20, 64)[0] > 0.01f);
+  // ...falls off with distance...
+  CHECK(dst.at(64 + 5, 64)[0] > dst.at(64 + 20, 64)[0]);
+  CHECK(dst.at(64 + 20, 64)[0] > dst.at(64 + 50, 64)[0]);
+  // ...and is roughly symmetric (the pyramid grid can shift it by a pixel).
+  const float l = dst.at(64 - 20, 64)[0], r = dst.at(64 + 20, 64)[0];
+  const float u = dst.at(64, 64 - 20)[0], d = dst.at(64, 64 + 20)[0];
+  CHECK(std::fabs(l - r) < 0.25f * r);
+  CHECK(std::fabs(u - d) < 0.25f * d);
+  CHECK(std::fabs(l - u) < 0.25f * u);
+}
+
+void test_larger_radius_spreads_wider() {
+  Image src = opaque(256, 256);
+  src.at(128, 128)[0] = 50.0f;
+  openglow::GlowParams small, large;
+  small.radius = 30;
+  large.radius = 600;
+  const Image a = render(src, small);
+  const Image b = render(src, large);
+  CHECK(b.at(128 + 60, 128)[0] > a.at(128 + 60, 128)[0]);
+}
+
+void test_radius_change_is_smooth() {
+  // Crossing a power of two must not make the glow jump.
+  Image src = opaque(256, 256);
+  src.at(128, 128)[0] = 50.0f;
+  openglow::GlowParams p;
+  float prev = -1;
+  for (float r = 100; r <= 160; r += 2) {
+    p.radius = r;
+    const float v = render(src, p).at(128 + 30, 128)[0];
+    if (prev >= 0) CHECK(std::fabs(v - prev) < 0.1f * prev + 1e-4f);
+    prev = v;
   }
 }
 
+void test_exposure_scales_glow() {
+  Image src = opaque(96, 96);
+  src.at(48, 48)[0] = 10.0f;
+  openglow::GlowParams p0, p1;
+  p1.exposure = 1.0f;
+  const Image a = render(src, p0);
+  const Image b = render(src, p1);
+  // Away from the source the result is pure glow, linear in 2^exposure.
+  const float la = a.at(60, 48)[0] * a.at(60, 48)[0];
+  const float lb = b.at(60, 48)[0] * b.at(60, 48)[0];
+  CHECK(la > 0);
+  CHECK(std::fabs(lb / la - 2.0f) < 0.01f);
+}
+
+void test_energy_does_not_depend_on_radius() {
+  Image src = opaque(256, 256);
+  src.at(128, 128)[0] = 20.0f;
+  const double base = 20.0 * 20.0;
+  openglow::GlowParams p;
+  p.radius = 40;
+  const double e_small = linear_red_energy(render(src, p)) - base;
+  p.radius = 400;
+  const double e_large = linear_red_energy(render(src, p)) - base;
+  CHECK(e_small > 0);
+  CHECK(std::fabs(e_large / e_small - 1.0) < 0.15);
+}
+
+void test_tint_colors_glow_and_keeps_luminance() {
+  Image src = opaque(96, 96);
+  for (int c = 0; c < 3; ++c) src.at(48, 48)[c] = 10.0f;
+  openglow::GlowParams plain, red;
+  red.tint = true;
+  red.tint_color[0] = 1.0f;
+  red.tint_color[1] = 0.0f;
+  red.tint_color[2] = 0.0f;
+  const Image a = render(src, plain);
+  const Image b = render(src, red);
+  const float* pa = a.at(60, 48);
+  const float* pb = b.at(60, 48);
+  CHECK(pb[0] > pa[0]);
+  CHECK(pb[1] == 0.0f);
+  CHECK(pb[2] == 0.0f);
+  auto luma = [](const float* p) {
+    return 0.2126f * p[0] * p[0] + 0.7152f * p[1] * p[1] + 0.0722f * p[2] * p[2];
+  };
+  CHECK(std::fabs(luma(pb) / luma(pa) - 1.0f) < 0.01f);
+}
+
+void test_tint_off_ignores_color() {
+  Image src = opaque(32, 32);
+  src.at(16, 16)[0] = 5.0f;
+  openglow::GlowParams a, b;
+  b.tint_color[1] = 0.0f;  // color set but tint unchecked
+  CHECK(render(src, a).px == render(src, b).px);
+}
+
+void test_alpha_is_preserved() {
+  Image src(40, 30);
+  for (int y = 0; y < 30; ++y)
+    for (int x = 0; x < 40; ++x) {
+      src.at(x, y)[0] = 0.8f;
+      src.at(x, y)[3] = (x + y) / 70.0f;
+    }
+  const Image dst = render(src, {});
+  for (int y = 0; y < 30; ++y)
+    for (int x = 0; x < 40; ++x) CHECK(dst.at(x, y)[3] == src.at(x, y)[3]);
+}
+
+void test_channel_order_matches_rgba() {
+  // A red point in BGRA must glow red, same as in RGBA.
+  Image rgba = opaque(48, 48), bgra = opaque(48, 48), argb(48, 48);
+  rgba.at(24, 24)[0] = 5.0f;
+  bgra.at(24, 24)[2] = 5.0f;
+  for (int y = 0; y < 48; ++y)
+    for (int x = 0; x < 48; ++x) argb.at(x, y)[0] = 1.0f;
+  argb.at(24, 24)[1] = 5.0f;
+  openglow::GlowParams p;
+  p.tint = true;
+  p.tint_color[0] = 1.0f;
+  p.tint_color[1] = 0.5f;
+  p.tint_color[2] = 0.25f;
+  const Image a = render(rgba, p, openglow::kRGBA);
+  const Image b = render(bgra, p, openglow::kBGRA);
+  const Image c = render(argb, p, openglow::kARGB);
+  for (int y = 0; y < 48; ++y)
+    for (int x = 0; x < 48; ++x) {
+      const float* pa = a.at(x, y);
+      const float* pb = b.at(x, y);
+      const float* pc = c.at(x, y);
+      CHECK(pa[0] == pb[2] && pa[1] == pb[1] && pa[2] == pb[0] && pa[3] == pb[3]);
+      CHECK(pa[0] == pc[1] && pa[1] == pc[2] && pa[2] == pc[3] && pa[3] == pc[0]);
+    }
+}
+
+void test_in_place_matches_separate_buffers() {
+  Image src = opaque(50, 40);
+  src.at(10, 10)[1] = 3.0f;
+  src.at(40, 30)[2] = 2.0f;
+  const Image expected = render(src, {});
+  openglow::render_glow(src.cview(), src.view(), {});
+  CHECK(src.px == expected.px);
+}
+
+void test_tiny_and_odd_sizes() {
+  const int sizes[][2] = {{1, 1}, {1, 7}, {7, 1}, {2, 3}, {3, 2}, {33, 17}};
+  for (const auto& s : sizes) {
+    Image src = opaque(s[0], s[1]);
+    src.at(0, 0)[0] = 1.0f;
+    openglow::GlowParams p;
+    p.radius = 2000;
+    const Image dst = render(src, p);
+    for (float v : dst.px) CHECK(std::isfinite(v));
+    CHECK(dst.at(0, 0)[0] >= 1.0f);
+  }
+}
+
+void test_padded_rows_are_left_alone() {
+  Image src(20, 10, 3);
+  Image dst(20, 10, 9);
+  for (float& v : src.px) v = 0.5f;
+  openglow::render_glow(src.cview(), dst.view(), {});
+  for (int y = 0; y < 10; ++y)
+    for (std::size_t x = 20 * 4; x < dst.stride; ++x) CHECK(dst.px[y * dst.stride + x] == 0.0f);
+}
+
+}  // namespace
+
 int main() {
-  test_passthrough_copies_pixels_with_padded_rows();
+  test_black_stays_black();
+  test_bright_point_spreads_symmetrically();
+  test_larger_radius_spreads_wider();
+  test_radius_change_is_smooth();
+  test_exposure_scales_glow();
+  test_energy_does_not_depend_on_radius();
+  test_tint_colors_glow_and_keeps_luminance();
+  test_tint_off_ignores_color();
+  test_alpha_is_preserved();
+  test_channel_order_matches_rgba();
+  test_in_place_matches_separate_buffers();
+  test_tiny_and_odd_sizes();
+  test_padded_rows_are_left_alone();
   if (failures) {
     std::fprintf(stderr, "%d check(s) failed\n", failures);
     return 1;
