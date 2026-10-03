@@ -42,7 +42,9 @@ class Backend {
   virtual void* Allocate(std::size_t bytes) = 0;
   virtual void Free(void* memory) = 0;
 
-  virtual bool DownsampleFirst(const Frame& src, const Plane& dst, float gain) = 0;
+  // threshold/knee: the bright pass in linear light (threshold 0 = off).
+  virtual bool DownsampleFirst(const Frame& src, const Plane& dst, float gain, float threshold,
+                               float knee) = 0;
   virtual bool Downsample(const Plane& src, const Plane& dst) = 0;
   virtual bool UpsampleAdd(const Plane& src, const Plane& dst, float src_weight) = 0;
   // tint_bgr already includes the 1/total normalization.
@@ -74,7 +76,7 @@ inline bool RunGlow(Backend& backend, const Frame& src, const Frame& dst,
     ok = levels[k].data != nullptr;
   }
 
-  if (ok) ok = backend.DownsampleFirst(in, levels[0], plan.gain);
+  if (ok) ok = backend.DownsampleFirst(in, levels[0], plan.gain, plan.threshold, plan.knee);
   for (int k = 1; k < plan.levels && ok; ++k) ok = backend.Downsample(levels[k - 1], levels[k]);
   // The deepest level fades in by last_weight (the CPU scales it in place).
   for (int k = plan.levels - 2; k >= 0 && ok; --k) {

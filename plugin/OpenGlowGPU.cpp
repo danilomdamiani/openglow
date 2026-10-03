@@ -65,8 +65,9 @@ class CudaBackend : public openglow_gpu::Backend {
   }
   void Free(void* memory) override { suite_->FreeDeviceMemory(device_, memory); }
 
-  bool DownsampleFirst(const Frame& src, const Plane& dst, float gain) override {
-    return openglow_gpu::CudaDownsampleFirst(src, dst, gain, stream_);
+  bool DownsampleFirst(const Frame& src, const Plane& dst, float gain, float threshold,
+                       float knee) override {
+    return openglow_gpu::CudaDownsampleFirst(src, dst, gain, threshold, knee, stream_);
   }
   bool Downsample(const Plane& src, const Plane& dst) override {
     return openglow_gpu::CudaDownsample(src, dst, stream_);
@@ -165,6 +166,7 @@ class OpenGlowGPU : public PrGPUFilterBase {
     params.radius = ParamFloat(GetParam(OPENGLOW_RADIUS, time));
     params.tint = ParamBool(GetParam(OPENGLOW_TINT, time));
     ParamColor(GetParam(OPENGLOW_TINT_COLOR, time), params.tint_color);
+    params.threshold = ParamFloat(GetParam(OPENGLOW_THRESHOLD, time));
 
     Frame src, dst;
     if (!DescribeFrame(in_frames[0], src) || !DescribeFrame(*out_frame, dst)) {

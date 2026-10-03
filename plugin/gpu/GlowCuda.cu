@@ -15,6 +15,17 @@ __constant__ float kTent[4] = {1.0f / 8, 3.0f / 8, 3.0f / 8, 1.0f / 8};
 __device__ inline float to_linear(float v) { return v * fabsf(v); }
 __device__ inline float to_gamma(float v) { return v < 0.0f ? -sqrtf(-v) : sqrtf(v); }
 
+// Soft-knee bright pass on linear RGB (bright_pass in glow.cpp).
+__device__ inline void bright_pass(float& r, float& g, float& b, float t, float k) {
+  const float m = fmaxf(r, fmaxf(g, b));
+  float soft = fminf(fmaxf(m - t + k, 0.0f), 2.0f * k);
+  soft = soft * soft / (4.0f * k + 1e-5f);
+  const float contrib = fmaxf(soft, m - t) / fmaxf(m, 1e-5f);
+  r *= contrib;
+  g *= contrib;
+  b *= contrib;
+}
+
 __device__ inline float4 load_frame(const char* base, int pitch, int half_float, int x, int y) {
   const char* row = base + static_cast<size_t>(pitch) * y;
   if (half_float) {
@@ -62,7 +73,8 @@ __device__ inline float4 bilinear(const float4* plane, int sw, int sh, int x, in
 }
 
 __global__ void downsample_first(const char* src, int src_pitch, int src_half, int sw, int sh,
-                                 float4* dst, int dw, int dh, float gain) {
+                                 float4* dst, int dw, int dh, float gain, float threshold,
+                                 float knee) {
   const int x = blockIdx.x * blockDim.x + threadIdx.x;
   const int y = blockIdx.y * blockDim.y + threadIdx.y;
   if (x >= dw || y >= dh) return;
@@ -73,9 +85,11 @@ __global__ void downsample_first(const char* src, int src_pitch, int src_half, i
       const int sx = min(max(2 * x - 1 + i, 0), sw - 1);
       const float w = kTent[j] * kTent[i];
       const float4 p = load_frame(src, src_pitch, src_half, sx, sy);
-      acc.x += w * (to_linear(p.x) * gain);
-      acc.y += w * (to_linear(p.y) * gain);
-      acc.z += w * (to_linear(p.z) * gain);
+      float cb = to_linear(p.x), cg = to_linear(p.y), cr = to_linear(p.z);
+      if (threshold > 0.0f) bright_pass(cb, cg, cr, threshold, knee);
+      acc.x += w * (cb * p.w * gain);
+      acc.y += w * (cg * p.w * gain);
+      acc.z += w * (cr * p.w * gain);
     }
   }
   acc.w = 0.0f;
@@ -124,11 +138,20 @@ __global__ void composite(const char* src, int src_pitch, int src_half, const fl
   if (x >= w || y >= h) return;
   const float4 g = bilinear(glow, gw, gh, x, y);
   const float4 p = load_frame(src, src_pitch, src_half, x, y);
-  float4 q;
-  q.x = to_gamma(to_linear(p.x) + g.x * tint_b);
-  q.y = to_gamma(to_linear(p.y) + g.y * tint_g);
-  q.z = to_gamma(to_linear(p.z) + g.z * tint_r);
-  q.w = p.w;
+  // Premultiplied source + glow; alpha grows by the glow's coverage (with
+  // alpha 1 this is exactly source + glow).
+  const float gb = g.x * tint_b, gg = g.y * tint_g, gr = g.z * tint_r;
+  const float pb = to_linear(p.x) * p.w + gb;
+  const float pg = to_linear(p.y) * p.w + gg;
+  const float pr = to_linear(p.z) * p.w + gr;
+  const float coverage = fminf(fmaxf(fmaxf(gb, fmaxf(gg, gr)), 0.0f), 1.0f);
+  const float out_a = p.w + coverage * (1.0f - p.w);
+  float4 q = make_float4(0, 0, 0, out_a);
+  if (out_a > 0.0f) {
+    q.x = to_gamma(pb / out_a);
+    q.y = to_gamma(pg / out_a);
+    q.z = to_gamma(pr / out_a);
+  }
   store_frame(dst, dst_pitch, dst_half, x, y, q);
 }
 
@@ -144,10 +167,11 @@ bool Launched() { return cudaPeekAtLastError() == cudaSuccess; }
 
 }  // namespace
 
-bool CudaDownsampleFirst(const Frame& src, const Plane& dst, float gain, void* stream) {
+bool CudaDownsampleFirst(const Frame& src, const Plane& dst, float gain, float threshold,
+                         float knee, void* stream) {
   downsample_first<<<Grid(dst.width, dst.height), kBlock, 0, Stream(stream)>>>(
       static_cast<const char*>(src.data), src.pitch, src.half ? 1 : 0, src.width, src.height,
-      static_cast<float4*>(dst.data), dst.width, dst.height, gain);
+      static_cast<float4*>(dst.data), dst.width, dst.height, gain, threshold, knee);
   return Launched();
 }
 

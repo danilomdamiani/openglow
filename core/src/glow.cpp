@@ -1,12 +1,14 @@
 // Glow via a mip pyramid (the "bloom" technique from real-time rendering):
 //
-//   1. Linearize the image and scale it by 2^exposure.
+//   1. Linearize the image, keep what passes the threshold, weight it by
+//      alpha and scale it by 2^exposure.
 //   2. Downsample repeatedly by 2 with a 4x4 tent filter. Level k is the image
 //      blurred by roughly 2^k pixels.
 //   3. Walk back up, upsampling each level bilinearly and adding it to the
 //      one above. Summing all levels gives a wide, soft falloff, close to the
 //      inverse-square look of physically based glows.
-//   4. Tint, then add the glow onto the original and return to gamma.
+//   4. Tint, add the glow onto the original (premultiplied, so it spills
+//      onto transparent areas) and return to gamma.
 //
 // Each level has a quarter of the pixels of the previous one, so the cost is
 // about the same for a radius of 20 or 500 pixels.
@@ -26,6 +28,19 @@ namespace {
 // float values survive the round trip.
 inline float to_linear(float v) { return v * std::fabs(v); }
 inline float to_gamma(float v) { return v < 0.0f ? -std::sqrt(-v) : std::sqrt(v); }
+
+// Soft-knee bright pass on linear RGB: keeps what is above the threshold t,
+// easing in over [t - knee, t + knee] so edges don't pop. Scales all three
+// channels by the same factor, so hue is kept.
+inline void bright_pass(float c[3], float t, float knee) {
+  const float b = std::max(c[0], std::max(c[1], c[2]));
+  float soft = std::min(std::max(b - t + knee, 0.0f), 2.0f * knee);
+  soft = soft * soft / (4.0f * knee + 1e-5f);
+  const float contrib = std::max(soft, b - t) / std::max(b, 1e-5f);
+  c[0] *= contrib;
+  c[1] *= contrib;
+  c[2] *= contrib;
+}
 
 // RGBA float buffer owned by the pyramid.
 struct Plane {
@@ -198,6 +213,11 @@ GlowPlan plan_glow(int width, int height, const GlowParams& params) {
     for (int i = 0; i < 3; ++i) tint[i] = luma > 1e-6f ? c[i] / luma : 0.0f;
   }
   for (int i = 0; i < 3; ++i) plan.tint[i] = tint[i] / total;
+
+  // The threshold slider is in gamma like the image; compare in linear.
+  const float t = std::max(0.0f, params.threshold);
+  plan.threshold = to_linear(t);
+  plan.knee = 0.5f * plan.threshold;
   return plan;
 }
 
@@ -213,15 +233,19 @@ void render_glow(const ConstImageView& src, const ImageView& dst, const GlowPara
   pyramid.reserve(levels);
   for (int k = 0; k < levels; ++k) pyramid.emplace_back(plan.width[k], plan.height[k]);
 
-  // The first level reads the source directly, linearizing and applying the
-  // exposure on the fly, so no full-resolution copy is made.
-  const float gain = plan.gain;
+  // The first level reads the source directly, so no full-resolution copy is
+  // made: linearize, keep what passes the threshold, weight by alpha (only
+  // visible pixels emit light; RGB under alpha 0 is ignored) and expose.
+  const float gain = plan.gain, threshold = plan.threshold, knee = plan.knee;
   downsample(
       width, height, [&](int y) { return src.row(y); },
       [&](const float* p, float* out) {
-        out[0] = to_linear(p[order.r]) * gain;
-        out[1] = to_linear(p[order.g]) * gain;
-        out[2] = to_linear(p[order.b]) * gain;
+        float c[3] = {to_linear(p[order.r]), to_linear(p[order.g]), to_linear(p[order.b])};
+        if (threshold > 0.0f) bright_pass(c, threshold, knee);
+        const float a = p[order.a];
+        out[0] = c[0] * a * gain;
+        out[1] = c[1] * a * gain;
+        out[2] = c[2] * a * gain;
         out[3] = 0.0f;
       },
       pyramid[0]);
@@ -258,13 +282,26 @@ void render_glow(const ConstImageView& src, const ImageView& dst, const GlowPara
           const float bot = r1[a + c] + (r1[b + c] - r1[a + c]) * fx;
           g[c] = top + (bot - top) * fy;
         }
+        // Composite premultiplied: source (linear * alpha) plus glow. The glow
+        // covers what it lights up, so alpha grows by the glow's coverage. With
+        // alpha 1 this is exactly source + glow, alpha 1.
         const float* p = in + x * 4;
         float* q = out + x * 4;
         const float alpha = p[order.a];
-        q[order.r] = to_gamma(to_linear(p[order.r]) + g[0] * tr);
-        q[order.g] = to_gamma(to_linear(p[order.g]) + g[1] * tg);
-        q[order.b] = to_gamma(to_linear(p[order.b]) + g[2] * tb);
-        q[order.a] = alpha;
+        const float gr = g[0] * tr, gg = g[1] * tg, gb = g[2] * tb;
+        const float pr = to_linear(p[order.r]) * alpha + gr;
+        const float pg = to_linear(p[order.g]) * alpha + gg;
+        const float pb = to_linear(p[order.b]) * alpha + gb;
+        const float coverage = std::min(std::max(std::max(gr, std::max(gg, gb)), 0.0f), 1.0f);
+        const float out_a = alpha + coverage * (1.0f - alpha);
+        if (out_a > 0.0f) {
+          q[order.r] = to_gamma(pr / out_a);
+          q[order.g] = to_gamma(pg / out_a);
+          q[order.b] = to_gamma(pb / out_a);
+        } else {
+          q[order.r] = q[order.g] = q[order.b] = 0.0f;
+        }
+        q[order.a] = out_a;
       }
     }
   });

@@ -5,7 +5,7 @@
 namespace openglow_gpu {
 namespace {
 
-// Mirrors the cbuffer in OpenGlow.hlsl (bound as 14 root constants): 4-byte
+// Mirrors the cbuffer in OpenGlow.hlsl (bound as 16 root constants): 4-byte
 // scalars only, so the C and HLSL packing rules agree.
 struct Params {
   int src_pitch = 0;
@@ -22,8 +22,10 @@ struct Params {
   float tint_b = 1.0f;
   float tint_g = 1.0f;
   float tint_r = 1.0f;
+  float threshold = 0.0f;
+  float knee = 0.0f;
 };
-static_assert(sizeof(Params) == 56, "Params must match the HLSL cbuffer");
+static_assert(sizeof(Params) == 64, "Params must match the HLSL cbuffer");
 
 struct View {
   void* resource;
@@ -87,12 +89,15 @@ bool DXShaders::Load(DXContext& context, const std::wstring& dir) {
   return true;
 }
 
-bool DXBackend::DownsampleFirst(const Frame& src, const Plane& dst, float gain) {
+bool DXBackend::DownsampleFirst(const Frame& src, const Plane& dst, float gain, float threshold,
+                                float knee) {
   Params p;
   SetSource(p, src);
   p.dst_width = dst.width;
   p.dst_height = dst.height;
   p.scale = gain;
+  p.threshold = threshold;
+  p.knee = knee;
   return Dispatch(device_, device_.shaders.downsample_first, p,
                   {{src.data}, {dst.data}}, dst.width, dst.height);
 }

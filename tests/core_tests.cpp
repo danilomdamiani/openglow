@@ -163,16 +163,96 @@ void test_tint_off_ignores_color() {
   CHECK(render(src, a).px == render(src, b).px);
 }
 
-void test_alpha_is_preserved() {
-  Image src(40, 30);
+void test_opaque_alpha_stays_opaque() {
+  Image src = opaque(40, 30);
   for (int y = 0; y < 30; ++y)
-    for (int x = 0; x < 40; ++x) {
-      src.at(x, y)[0] = 0.8f;
-      src.at(x, y)[3] = (x + y) / 70.0f;
-    }
+    for (int x = 0; x < 40; ++x) src.at(x, y)[0] = (x + y) / 70.0f;
+  src.at(20, 15)[1] = 6.0f;
   const Image dst = render(src, {});
   for (int y = 0; y < 30; ++y)
-    for (int x = 0; x < 40; ++x) CHECK(dst.at(x, y)[3] == src.at(x, y)[3]);
+    for (int x = 0; x < 40; ++x) {
+      CHECK(dst.at(x, y)[3] == 1.0f);
+      CHECK(dst.at(x, y)[0] >= src.at(x, y)[0] - 1e-6f);  // glow only adds light
+    }
+}
+
+// A bright opaque square on a fully transparent background, like a title.
+Image square_on_transparent(float garbage) {
+  Image src(96, 96);
+  for (int y = 0; y < 96; ++y)
+    for (int x = 0; x < 96; ++x) {
+      float* p = src.at(x, y);
+      p[0] = p[1] = p[2] = garbage;  // RGB under alpha 0 must not matter
+    }
+  for (int y = 44; y < 52; ++y)
+    for (int x = 44; x < 52; ++x) {
+      float* p = src.at(x, y);
+      p[0] = 1.0f;
+      p[1] = 0.6f;
+      p[2] = 0.2f;
+      p[3] = 1.0f;
+    }
+  return src;
+}
+
+void test_glow_spills_onto_transparent_background() {
+  openglow::GlowParams p;
+  p.radius = 60;
+  p.exposure = 2.0f;
+  const Image dst = render(square_on_transparent(0.0f), p);
+  // The square stays opaque.
+  CHECK(dst.at(47, 47)[3] == 1.0f);
+  // Outside it there is now an aura: visible, colored like the source, and
+  // fading with distance.
+  const float* near = dst.at(51 + 3, 47);
+  const float* mid = dst.at(51 + 10, 47);
+  const float* far = dst.at(51 + 30, 47);
+  CHECK(near[3] > 0.0f);
+  CHECK(mid[3] > 0.0f);
+  CHECK(near[3] > mid[3]);
+  CHECK(mid[3] > far[3]);
+  CHECK(near[0] > near[1] && near[1] > near[2]);  // orange like the square
+  CHECK(mid[0] > 0.0f);
+}
+
+void test_transparent_rgb_is_ignored() {
+  openglow::GlowParams p;
+  p.radius = 60;
+  CHECK(render(square_on_transparent(0.0f), p).px == render(square_on_transparent(5.0f), p).px);
+}
+
+void test_threshold_zero_is_unchanged() {
+  Image src = opaque(64, 48);
+  src.at(20, 20)[0] = 3.0f;
+  src.at(40, 30)[1] = 0.4f;
+  openglow::GlowParams off, zero;
+  zero.threshold = 0.0f;
+  zero.radius = off.radius = 80;
+  CHECK(render(src, off).px == render(src, zero).px);
+}
+
+void test_threshold_keeps_only_bright_parts() {
+  openglow::GlowParams p;
+  p.radius = 600;  // relative to 1080 lines: about 35 px on this 64 px frame
+  p.threshold = 0.6f;
+
+  // A dim area (0.3, below the threshold) adds no glow at all...
+  Image dim = opaque(64, 64);
+  for (int y = 16; y < 48; ++y)
+    for (int x = 16; x < 48; ++x) dim.at(x, y)[0] = dim.at(x, y)[1] = dim.at(x, y)[2] = 0.3f;
+  const Image dim_out = render(dim, p);
+  for (int y = 0; y < 64; ++y)
+    for (int x = 0; x < 64; ++x) CHECK(std::fabs(dim_out.at(x, y)[0] - dim.at(x, y)[0]) < 1e-6f);
+  // ...while without the threshold it does glow.
+  openglow::GlowParams no_threshold = p;
+  no_threshold.threshold = 0.0f;
+  CHECK(render(dim, no_threshold).at(10, 32)[0] > 0.01f);
+
+  // A bright spot (1.0, above the threshold) still glows.
+  Image spot = opaque(64, 64);
+  for (int y = 30; y < 34; ++y)
+    for (int x = 30; x < 34; ++x) spot.at(x, y)[0] = spot.at(x, y)[1] = spot.at(x, y)[2] = 1.0f;
+  CHECK(render(spot, p).at(33 + 6, 32)[0] > 0.01f);
 }
 
 void test_channel_order_matches_rgba() {
@@ -243,7 +323,11 @@ int main() {
   test_energy_does_not_depend_on_radius();
   test_tint_colors_glow_and_keeps_luminance();
   test_tint_off_ignores_color();
-  test_alpha_is_preserved();
+  test_opaque_alpha_stays_opaque();
+  test_glow_spills_onto_transparent_background();
+  test_transparent_rgb_is_ignored();
+  test_threshold_zero_is_unchanged();
+  test_threshold_keeps_only_bright_parts();
   test_channel_order_matches_rgba();
   test_in_place_matches_separate_buffers();
   test_tiny_and_odd_sizes();

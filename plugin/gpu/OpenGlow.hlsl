@@ -2,7 +2,8 @@
 // pass, each compiled to its own .cso. The math mirrors core/src/glow.cpp line
 // by line (see GlowGpu.h for the order of the passes); keep them in sync.
 //
-// Frames are Premiere's BGRA 32f or 16f buffers with a pitch in bytes.
+// Frames are Premiere's BGRA 32f or 16f buffers (straight alpha) with a pitch
+// in bytes.
 // Pyramid levels are tightly packed float4 BGRA planes.
 //
 // 16f is read with f16tof32 rather than native half types, which older GPUs
@@ -23,6 +24,8 @@ cbuffer Params : register(b0) {
   float tint_b;
   float tint_g;
   float tint_r;
+  float threshold;  // bright pass in linear light, 0 = off
+  float knee;
 };
 
 RWByteAddressBuffer buf0 : register(u0);
@@ -31,13 +34,22 @@ RWByteAddressBuffer buf2 : register(u2);
 
 // Parameters are root constants and buffers root UAVs: nothing to allocate
 // per dispatch. Root parameter order: constants, u0, u1[, u2].
-#define ROOT_2 "RootConstants(num32BitConstants = 14, b0), UAV(u0), UAV(u1)"
-#define ROOT_3 "RootConstants(num32BitConstants = 14, b0), UAV(u0), UAV(u1), UAV(u2)"
+#define ROOT_2 "RootConstants(num32BitConstants = 16, b0), UAV(u0), UAV(u1)"
+#define ROOT_3 "RootConstants(num32BitConstants = 16, b0), UAV(u0), UAV(u1), UAV(u2)"
 
 static const float kTent[4] = {1.0f / 8, 3.0f / 8, 3.0f / 8, 1.0f / 8};
 
 float to_linear(float v) { return v * abs(v); }
 float to_gamma(float v) { return v < 0.0f ? -sqrt(-v) : sqrt(v); }
+
+// Soft-knee bright pass on linear RGB (bright_pass in glow.cpp).
+float3 bright_pass(float3 c, float t, float k) {
+  const float b = max(c.x, max(c.y, c.z));
+  float soft = min(max(b - t + k, 0.0f), 2.0f * k);
+  soft = soft * soft / (4.0f * k + 1e-5f);
+  const float contrib = max(soft, b - t) / max(b, 1e-5f);
+  return c * contrib;
+}
 
 float4 load_frame(RWByteAddressBuffer b, int pitch, int half_float, int x, int y) {
   if (half_float) {
@@ -85,7 +97,8 @@ float4 bilinear(RWByteAddressBuffer b, int sw, int sh, int x, int y) {
   return top + (bot - top) * fy;
 }
 
-// Frame (u0) -> pyramid level 0 (u1): linearize, apply exposure, 4x4 tent.
+// Frame (u0) -> pyramid level 0 (u1): linearize, bright pass, weight by
+// (straight) alpha, apply exposure, 4x4 tent.
 [RootSignature(ROOT_2)]
 [numthreads(16, 16, 1)]
 void downsample_first(uint3 id : SV_DispatchThreadID) {
@@ -98,9 +111,11 @@ void downsample_first(uint3 id : SV_DispatchThreadID) {
       const int sx = clamp(2 * x - 1 + i, 0, src_width - 1);
       const float w = kTent[j] * kTent[i];
       const float4 p = load_frame(buf0, src_pitch, src_half, sx, sy);
-      acc.x += w * (to_linear(p.x) * scale);
-      acc.y += w * (to_linear(p.y) * scale);
-      acc.z += w * (to_linear(p.z) * scale);
+      float3 c = float3(to_linear(p.x), to_linear(p.y), to_linear(p.z));
+      if (threshold > 0.0f) c = bright_pass(c, threshold, knee);
+      acc.x += w * (c.x * p.w * scale);
+      acc.y += w * (c.y * p.w * scale);
+      acc.z += w * (c.z * p.w * scale);
     }
   }
   acc.w = 0.0f;
@@ -142,10 +157,18 @@ void composite(uint3 id : SV_DispatchThreadID) {
   if (x >= dst_width || y >= dst_height) return;
   const float4 g = bilinear(buf1, glow_width, glow_height, x, y);
   const float4 p = load_frame(buf0, src_pitch, src_half, x, y);
-  float4 q;
-  q.x = to_gamma(to_linear(p.x) + g.x * tint_b);
-  q.y = to_gamma(to_linear(p.y) + g.y * tint_g);
-  q.z = to_gamma(to_linear(p.z) + g.z * tint_r);
-  q.w = p.w;
+  // Premultiplied source + glow; alpha grows by the glow's coverage (with
+  // alpha 1 this is exactly source + glow).
+  const float3 glow = float3(g.x * tint_b, g.y * tint_g, g.z * tint_r);
+  const float3 premult = float3(to_linear(p.x), to_linear(p.y), to_linear(p.z)) * p.w + glow;
+  const float coverage = min(max(max(glow.x, max(glow.y, glow.z)), 0.0f), 1.0f);
+  const float out_a = p.w + coverage * (1.0f - p.w);
+  float4 q = 0;
+  if (out_a > 0.0f) {
+    q.x = to_gamma(premult.x / out_a);
+    q.y = to_gamma(premult.y / out_a);
+    q.z = to_gamma(premult.z / out_a);
+  }
+  q.w = out_a;
   store_frame(buf2, dst_pitch, dst_half, x, y, q);
 }

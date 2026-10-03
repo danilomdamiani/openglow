@@ -184,6 +184,35 @@ HostFrame MakeFrame(int w, int h, bool half, int pad) {
   return f;
 }
 
+// A title-like frame: transparent background (with garbage RGB, which must be
+// ignored), an opaque bright bar and a half-transparent disc.
+HostFrame MakeShapeFrame(int w, int h, bool half, int pad) {
+  HostFrame f(w, h, half, pad);
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      float b = 7.0f, g = 0.3f, r = 2.0f, a = 0.0f;
+      if (x > w / 4 && x < w / 2 && y > h / 3 && y < h / 2) {
+        b = 0.2f;
+        g = 0.7f;
+        r = 1.0f;
+        a = 1.0f;
+      }
+      const float dx = x - 0.7f * w, dy = y - 0.6f * h;
+      if (dx * dx + dy * dy < 0.01f * w * w) {
+        b = 1.5f;
+        g = 0.4f;
+        r = 0.1f;
+        a = 0.5f;
+      }
+      f.Set(x, y, 0, b);
+      f.Set(x, y, 1, g);
+      f.Set(x, y, 2, r);
+      f.Set(x, y, 3, a);
+    }
+  }
+  return f;
+}
+
 // CPU reference on exactly the values the GPU reads.
 std::vector<float> Reference(const HostFrame& in, const openglow::GlowParams& params) {
   const std::size_t stride = static_cast<std::size_t>(in.width) * 4;
@@ -233,8 +262,8 @@ struct Harness {
 int failures = 0;
 
 void Check(Harness& h, const char* name, int w, int hgt, bool half, int pad, bool in_place,
-           const openglow::GlowParams& params) {
-  HostFrame in = MakeFrame(w, hgt, half, pad);
+           const openglow::GlowParams& params, bool shapes = false) {
+  HostFrame in = shapes ? MakeShapeFrame(w, hgt, half, pad) : MakeFrame(w, hgt, half, pad);
   ComPtr<ID3D12Resource> src_buf, dst_buf;
   src_buf.Attach(h.gpu.CreateBuffer(in.bytes.size(), D3D12_HEAP_TYPE_DEFAULT));
   h.gpu.Upload(src_buf.Get(), in.bytes.data(), in.bytes.size());
@@ -254,15 +283,20 @@ void Check(Harness& h, const char* name, int w, int hgt, bool half, int pad, boo
   const std::vector<float> ref = Reference(in, params);
 
   // 32f: float rounding only. 16f: the output is rounded to half too.
+  // Colors are compared premultiplied by alpha: where the glow barely covers a
+  // transparent pixel, its color is a ratio of tiny numbers and invisible.
   const double tol = half ? 2e-3 : 2e-5;
   double worst = 0;
   for (int y = 0; y < hgt; ++y)
-    for (int x = 0; x < w; ++x)
+    for (int x = 0; x < w; ++x) {
+      const float* r = &ref[(static_cast<std::size_t>(y) * w + x) * 4];
+      const double ra = r[3], oa = out.Get(x, y, 3);
       for (int c = 0; c < 4; ++c) {
-        const double r = ref[(static_cast<std::size_t>(y) * w + x) * 4 + c];
-        const double err = std::fabs(out.Get(x, y, c) - r) / std::max(1.0, std::fabs(r));
-        worst = std::max(worst, err);
+        const double rv = c == 3 ? ra : r[c] * ra;
+        const double ov = c == 3 ? oa : out.Get(x, y, c) * oa;
+        worst = std::max(worst, std::fabs(ov - rv) / std::max(1.0, std::fabs(rv)));
       }
+    }
 
   const bool pass = ok && worst <= tol && h.live_buffers == 0;
   if (!pass) ++failures;
@@ -341,6 +375,20 @@ int main(int argc, char** argv) {
   Check(h, "16f default", 301, 173, true, 0, false, base);
   Check(h, "16f exposure+tint, padded, in place", 299, 171, true, 24, true, bright);
   Check(h, "32f 1080p", 1920, 1080, false, 0, false, bright);
+
+  openglow::GlowParams aura = base;
+  aura.radius = 400;
+  aura.exposure = 1.0f;
+  openglow::GlowParams thresholded = bright;
+  thresholded.threshold = 0.6f;
+  openglow::GlowParams thresholded_aura = aura;
+  thresholded_aura.threshold = 0.8f;
+
+  Check(h, "32f shapes on transparent", 320, 180, false, 0, false, aura, true);
+  Check(h, "16f shapes on transparent, in place", 320, 180, true, 16, true, aura, true);
+  Check(h, "32f threshold 0.6", 301, 173, false, 0, false, thresholded);
+  Check(h, "16f threshold 0.6, padded", 301, 173, true, 40, false, thresholded);
+  Check(h, "32f shapes + threshold 0.8", 320, 180, false, 0, false, thresholded_aura, true);
 
   Time(h, 1920, 1080);
   Time(h, 3840, 2160);

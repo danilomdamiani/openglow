@@ -3,9 +3,15 @@
 An open-source glow effect for Adobe Premiere Pro (and After Effects), in the
 spirit of Deep Glow, built for speed.
 
-Status: **stage 2**. The glow has Exposure, Radius, Tint and Tint Color, and
-runs on the GPU in Premiere Pro on Windows (DirectX 12, and CUDA when built
-with the CUDA toolkit), with the CPU as fallback.
+Status: **stage 2**. The glow has Exposure, Radius, Tint, Tint Color and
+Threshold, and runs on the GPU in Premiere Pro on Windows (DirectX 12, and CUDA
+when built with the CUDA toolkit), with the CPU as fallback.
+
+- **Threshold** keeps only the bright parts of the image (with a soft knee), so
+  on video the highlights bloom instead of the whole frame.
+- On titles and shapes over transparency, the glow spills out around them: only
+  visible pixels emit light, and the output alpha grows by the glow's coverage.
+  Opaque footage stays opaque.
 
 ## How it works
 

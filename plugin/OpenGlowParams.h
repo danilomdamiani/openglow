@@ -15,13 +15,15 @@ enum {
   OPENGLOW_RADIUS,
   OPENGLOW_TINT,
   OPENGLOW_TINT_COLOR,
+  OPENGLOW_THRESHOLD,
   OPENGLOW_NUM_PARAMS
 };
 
 // Disk IDs identify parameters in saved projects: never reuse or renumber.
 enum {
   EXPOSURE_DISK_ID = 1,
-  RADIUS_DISK_ID,
-  TINT_DISK_ID,
-  TINT_COLOR_DISK_ID,
+  RADIUS_DISK_ID = 2,
+  TINT_DISK_ID = 3,
+  TINT_COLOR_DISK_ID = 4,
+  THRESHOLD_DISK_ID = 5,
 };

@@ -87,6 +87,10 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data) {
   AEFX_CLR_STRUCT(def);
   PF_ADD_COLOR("Tint Color", 255, 255, 255, TINT_COLOR_DISK_ID);
 
+  AEFX_CLR_STRUCT(def);
+  PF_ADD_FLOAT_SLIDERX("Threshold", 0, 1, 0, 1, 0, PF_Precision_HUNDREDTHS,
+                       PF_ValueDisplayFlag_NONE, 0, THRESHOLD_DISK_ID);
+
   out_data->num_params = OPENGLOW_NUM_PARAMS;
   return err;
 }
@@ -122,22 +126,34 @@ openglow::GlowParams ReadParams(PF_ParamDef* params[]) {
   p.tint_color[0] = color.red / 255.0f;
   p.tint_color[1] = color.green / 255.0f;
   p.tint_color[2] = color.blue / 255.0f;
+  p.threshold = static_cast<float>(params[OPENGLOW_THRESHOLD]->u.fs_d.value);
   return p;
 }
 
 // Integer formats go through a float copy: unpack, glow in place, pack.
+// The core works on straight alpha; After Effects' 8/16-bit worlds are
+// premultiplied, so those are unpremultiplied going in and premultiplied
+// coming out. Premiere's BGRA is straight already.
 template <typename Channel>
 void RenderInteger(PF_EffectWorld* input, PF_EffectWorld* output, int width, int height,
                    float max_value, const openglow::GlowParams& params,
-                   openglow::ChannelOrder order) {
+                   openglow::ChannelOrder order, bool premultiplied) {
   const std::size_t stride = static_cast<std::size_t>(width) * 4;
   std::vector<float> buffer(stride * height);
   const float to_float = 1.0f / max_value;
+  const int color[3] = {order.r, order.g, order.b};
   for (int y = 0; y < height; ++y) {
     const Channel* in = reinterpret_cast<const Channel*>(
         reinterpret_cast<const char*>(input->data) + static_cast<std::ptrdiff_t>(y) * input->rowbytes);
     float* row = buffer.data() + y * stride;
     for (std::size_t i = 0; i < stride; ++i) row[i] = in[i] * to_float;
+    if (premultiplied) {
+      for (int x = 0; x < width; ++x) {
+        float* p = row + x * 4;
+        const float a = p[order.a];
+        for (int c : color) p[c] = a > 0.0f ? p[c] / a : 0.0f;
+      }
+    }
   }
 
   const openglow::ImageView view{buffer.data(), width, height, stride};
@@ -146,10 +162,15 @@ void RenderInteger(PF_EffectWorld* input, PF_EffectWorld* output, int width, int
   for (int y = 0; y < height; ++y) {
     Channel* out = reinterpret_cast<Channel*>(
         reinterpret_cast<char*>(output->data) + static_cast<std::ptrdiff_t>(y) * output->rowbytes);
-    const float* row = buffer.data() + y * stride;
-    for (std::size_t i = 0; i < stride; ++i) {
-      const float v = std::clamp(row[i], 0.0f, 1.0f) * max_value + 0.5f;
-      out[i] = static_cast<Channel>(v);
+    float* row = buffer.data() + y * stride;
+    for (int x = 0; x < width; ++x) {
+      float* p = row + x * 4;
+      const float a = std::clamp(p[order.a], 0.0f, 1.0f);
+      for (int c = 0; c < 4; ++c) {
+        float v = std::clamp(p[c], 0.0f, 1.0f);
+        if (premultiplied && c != order.a) v *= a;
+        out[x * 4 + c] = static_cast<Channel>(v * max_value + 0.5f);
+      }
     }
   }
 }
@@ -177,14 +198,16 @@ PF_Err Render(PF_InData* in_data, PF_OutData* /*out_data*/, PF_ParamDef* params[
       }
       break;
     case HostFormat::BGRA8:
-      RenderInteger<A_u_char>(input, output, width, height, 255.0f, glow, openglow::kBGRA);
+      RenderInteger<A_u_char>(input, output, width, height, 255.0f, glow, openglow::kBGRA,
+                              false);
       break;
     case HostFormat::ARGB8:
-      RenderInteger<A_u_char>(input, output, width, height, PF_MAX_CHAN8, glow, openglow::kARGB);
+      RenderInteger<A_u_char>(input, output, width, height, PF_MAX_CHAN8, glow, openglow::kARGB,
+                              true);
       break;
     case HostFormat::ARGB16:
       RenderInteger<A_u_short>(input, output, width, height, PF_MAX_CHAN16, glow,
-                               openglow::kARGB);
+                               openglow::kARGB, true);
       break;
     default:
       return PF_Err_BAD_CALLBACK_PARAM;

@@ -7,7 +7,8 @@
 
 namespace openglow_gpu {
 
-bool CudaDownsampleFirst(const Frame& src, const Plane& dst, float gain, void* stream);
+bool CudaDownsampleFirst(const Frame& src, const Plane& dst, float gain, float threshold,
+                         float knee, void* stream);
 bool CudaDownsample(const Plane& src, const Plane& dst, void* stream);
 bool CudaUpsampleAdd(const Plane& src, const Plane& dst, float src_weight, void* stream);
 bool CudaComposite(const Frame& src, const Plane& glow, const Frame& dst,
