@@ -58,7 +58,7 @@ PF_Err GlobalSetup(PF_InData* in_data, PF_OutData* out_data) {
     // Tell Premiere which pixel formats we handle so it skips conversions.
     ScopedSuite<PF_PixelFormatSuite1> pixel_formats(in_data, kPFPixelFormatSuite,
                                                     kPFPixelFormatSuiteVersion1);
-    if (!pixel_formats.get()) return PF_Err_MISSING_SUITE;
+    if (!pixel_formats.get()) return A_Err_MISSING_SUITE;
     pixel_formats->ClearSupportedPixelFormats(in_data->effect_ref);
     pixel_formats->AddSupportedPixelFormat(in_data->effect_ref, PrPixelFormat_BGRA_4444_32f);
     pixel_formats->AddSupportedPixelFormat(in_data->effect_ref, PrPixelFormat_BGRA_4444_8u);
@@ -135,9 +135,12 @@ extern "C" DllExport PF_Err PluginDataEntryFunction2(PF_PluginDataPtr inPtr,
                                                      SPBasicSuite* /*inSPBasicSuitePtr*/,
                                                      const char* /*inHostName*/,
                                                      const char* /*inHostVersion*/) {
-  return PF_REGISTER_EFFECT_EXT2(inPtr, inPluginDataCallBackPtr, OPENGLOW_NAME,
-                                 OPENGLOW_MATCH_NAME, OPENGLOW_CATEGORY, AE_RESERVED_INFO,
-                                 "EffectMain", OPENGLOW_SUPPORT_URL);
+  // The macro assigns to a local named `result`.
+  PF_Err result = PF_Err_INVALID_CALLBACK;
+  result = PF_REGISTER_EFFECT_EXT2(inPtr, inPluginDataCallBackPtr, OPENGLOW_NAME,
+                                   OPENGLOW_MATCH_NAME, OPENGLOW_CATEGORY, AE_RESERVED_INFO,
+                                   "EffectMain", OPENGLOW_SUPPORT_URL);
+  return result;
 }
 
 PF_Err EffectMain(PF_Cmd cmd, PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[],

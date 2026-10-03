@@ -62,7 +62,7 @@ target_include_directories(OpenGlow PRIVATE ${AE_SDK_INCLUDES})
 target_link_libraries(OpenGlow PRIVATE openglow_core)
 
 if(WIN32)
-  target_compile_definitions(OpenGlow PRIVATE MSWindows WIN32 _WINDOWS)
+  target_compile_definitions(OpenGlow PRIVATE MSWindows WIN32 _WINDOWS NOMINMAX)
   set_target_properties(OpenGlow PROPERTIES PREFIX "" SUFFIX ".aex")
   target_compile_options(OpenGlow PRIVATE /W3)
 else()

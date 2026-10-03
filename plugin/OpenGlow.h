@@ -7,6 +7,7 @@
 #endif
 
 #include "entry.h"
+#include "SPBasic.h"
 #include "AE_Effect.h"
 #include "AE_EffectCB.h"
 #include "AE_EffectCBSuites.h"
