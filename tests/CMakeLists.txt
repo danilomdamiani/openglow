@@ -1,0 +1,3 @@
+add_executable(openglow_core_tests core_tests.cpp)
+target_link_libraries(openglow_core_tests PRIVATE openglow_core)
+add_test(NAME openglow_core_tests COMMAND openglow_core_tests)

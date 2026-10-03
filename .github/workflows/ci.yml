@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  core:
+    # Builds and tests the SDK-independent core on every platform we ship.
+    # The plugin itself needs the Adobe SDK, which can't live in a public repo.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            extra: ""
+          - os: macos-14
+            extra: "'-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64'"
+          - os: ubuntu-latest
+            extra: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DOPENGLOW_BUILD_PLUGIN=OFF ${{ matrix.extra }}
+        shell: bash
+      - name: Build
+        run: cmake --build build --config Release --parallel
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
