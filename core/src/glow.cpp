@@ -154,11 +154,9 @@ void upsample_add(const Plane& src, Plane& dst, float dst_weight) {
 
 }  // namespace
 
-void render_glow(const ConstImageView& src, const ImageView& dst, const GlowParams& params,
-                 ChannelOrder order) {
-  const int width = std::min(src.width, dst.width);
-  const int height = std::min(src.height, dst.height);
-  if (width <= 0 || height <= 0) return;
+GlowPlan plan_glow(int width, int height, const GlowParams& params) {
+  GlowPlan plan;
+  if (width <= 0 || height <= 0) return plan;
 
   // Radius is relative to a 1080p frame so the look doesn't change between
   // proxies, 4K, or Premiere's reduced playback resolution.
@@ -166,28 +164,58 @@ void render_glow(const ConstImageView& src, const ImageView& dst, const GlowPara
   // Level k blurs by about 2^k pixels. The fractional part fades the last
   // level in, so dragging the slider is smooth instead of stepping.
   const float levels_f = std::max(1.0f, std::log2(radius_px));
-  int levels = static_cast<int>(std::ceil(levels_f));
+  int levels = std::min(static_cast<int>(std::ceil(levels_f)), GlowPlan::kMaxLevels);
   float last_weight = levels_f - std::floor(levels_f);
   if (last_weight <= 0.0f) last_weight = 1.0f;
 
-  // Build the pyramid, stopping when a level would be smaller than 1 pixel.
-  std::vector<Plane> pyramid;
-  pyramid.reserve(levels);
+  // Size the pyramid, stopping when a level would be smaller than 1 pixel.
+  int count = 0;
   int w = width, h = height;
-  for (int k = 0; k < levels; ++k) {
+  while (count < levels) {
     w = (w + 1) / 2;
     h = (h + 1) / 2;
-    pyramid.emplace_back(w, h);
+    plan.width[count] = w;
+    plan.height[count] = h;
+    ++count;
     if (w == 1 && h == 1) break;
   }
-  if (static_cast<int>(pyramid.size()) < levels) {
-    levels = static_cast<int>(pyramid.size());
+  if (count < levels) {
+    levels = count;
     last_weight = 1.0f;
   }
+  plan.levels = levels;
+  plan.last_weight = last_weight;
+  plan.gain = std::exp2(params.exposure);
+
+  // Every level contributes equally (the last one partially), normalized so
+  // the total glow energy doesn't depend on the radius. Tint keeps the glow's
+  // luminance so changing the color doesn't change how bright it looks.
+  const float total = (levels - 1) + last_weight;
+  float tint[3] = {1.0f, 1.0f, 1.0f};
+  if (params.tint) {
+    const float* c = params.tint_color;
+    const float luma = 0.2126f * c[0] + 0.7152f * c[1] + 0.0722f * c[2];
+    for (int i = 0; i < 3; ++i) tint[i] = luma > 1e-6f ? c[i] / luma : 0.0f;
+  }
+  for (int i = 0; i < 3; ++i) plan.tint[i] = tint[i] / total;
+  return plan;
+}
+
+void render_glow(const ConstImageView& src, const ImageView& dst, const GlowParams& params,
+                 ChannelOrder order) {
+  const int width = std::min(src.width, dst.width);
+  const int height = std::min(src.height, dst.height);
+  const GlowPlan plan = plan_glow(width, height, params);
+  const int levels = plan.levels;
+  if (levels == 0) return;
+
+  std::vector<Plane> pyramid;
+  pyramid.reserve(levels);
+  for (int k = 0; k < levels; ++k) pyramid.emplace_back(plan.width[k], plan.height[k]);
 
   // The first level reads the source directly, linearizing and applying the
   // exposure on the fly, so no full-resolution copy is made.
-  const float gain = std::exp2(params.exposure);
+  const float gain = plan.gain;
   downsample(
       width, height, [&](int y) { return src.row(y); },
       [&](const float* p, float* out) {
@@ -199,28 +227,16 @@ void render_glow(const ConstImageView& src, const ImageView& dst, const GlowPara
       pyramid[0]);
   for (int k = 1; k < levels; ++k) downsample(pyramid[k - 1], pyramid[k]);
 
-  // Every level contributes equally (the last one partially), normalized so
-  // the total glow energy doesn't depend on the radius.
-  const float total = (levels - 1) + last_weight;
   // Collapse: pyramid[k] = pyramid[k] + upsample(pyramid[k+1]). Scaling the
   // deepest level by last_weight before the walk applies its fade.
   {
     Plane& deepest = pyramid[levels - 1];
     const std::size_t n = static_cast<std::size_t>(deepest.width) * deepest.height * 4;
-    for (std::size_t i = 0; i < n; ++i) deepest.data[i] *= last_weight;
+    for (std::size_t i = 0; i < n; ++i) deepest.data[i] *= plan.last_weight;
   }
   for (int k = levels - 2; k >= 0; --k) upsample_add(pyramid[k + 1], pyramid[k], 1.0f);
 
-  // Tint keeps the glow's luminance so changing the color doesn't change how
-  // bright it looks.
-  float tint[3] = {1.0f, 1.0f, 1.0f};
-  if (params.tint) {
-    const float* c = params.tint_color;
-    const float luma = 0.2126f * c[0] + 0.7152f * c[1] + 0.0722f * c[2];
-    for (int i = 0; i < 3; ++i) tint[i] = luma > 1e-6f ? c[i] / luma : 0.0f;
-  }
-  const float norm = 1.0f / total;
-  const float tr = tint[0] * norm, tg = tint[1] * norm, tb = tint[2] * norm;
+  const float tr = plan.tint[0], tg = plan.tint[1], tb = plan.tint[2];
 
   // Upsample the collapsed glow to full resolution and composite.
   const Plane& glow = pyramid[0];
