@@ -1,0 +1,8 @@
+build/
+out/
+.vs/
+.vscode/
+*.user
+.DS_Store
+# The Adobe SDKs cannot be redistributed; keep local copies out of git.
+sdk/
