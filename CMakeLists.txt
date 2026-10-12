@@ -10,6 +10,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # redistribute. Point AE_SDK_ROOT at your local copy (the folder that contains
 # "Examples") to build it. Without it, only the core library and tests build.
 set(AE_SDK_ROOT "$ENV{AE_SDK_ROOT}" CACHE PATH "Path to the After Effects SDK root")
+# Optional: the Premiere Pro SDK (the folder that contains "Examples") adds the
+# GPU renderer for Premiere. Without it the plugin renders on the CPU only.
+set(PREMIERE_SDK_ROOT "$ENV{PREMIERE_SDK_ROOT}" CACHE PATH "Path to the Premiere Pro SDK root")
 
 if(AE_SDK_ROOT)
   set(_plugin_default ON)
