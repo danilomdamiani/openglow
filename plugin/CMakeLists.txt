@@ -78,3 +78,12 @@ else()
   )
   target_compile_options(OpenGlow PRIVATE -Wall)
 endif()
+
+# Premiere GPU renderer (Windows: DirectX 12, plus CUDA when nvcc is found).
+if(PREMIERE_SDK_ROOT)
+  if(WIN32)
+    include(gpu/GpuWindows.cmake)
+  else()
+    message(STATUS "OpenGlow: the GPU renderer is Windows-only for now; building CPU only")
+  endif()
+endif()
